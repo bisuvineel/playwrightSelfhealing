@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Demo Shop — Cart</title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; }
+      .row { display: flex; justify-content: space-between; padding: 0.5rem 0; border-bottom: 1px solid #ddd; }
+      button { padding: 0.5rem 1rem; margin-right: 0.5rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Your cart</h1>
+
+    <div class="row"><span>Noise-cancelling headphones</span><span>£149.00</span></div>
+    <div class="row"><span>USB-C cable</span><span>£12.00</span></div>
+    <div class="row"><strong>Total</strong><strong data-testid="cart-total">£161.00</strong></div>
+
+    <!--
+      NOTE FOR THE DEMO:
+      This markup is the "new" version of the app. The ids the page objects were
+      written against (#checkout-button, #promo-field) no longer exist — a redesign
+      renamed them. That is what the healer has to recover from.
+    -->
+    <p>
+      <button id="continue-shopping-v3" type="button">Continue shopping</button>
+      <button id="go-to-checkout-v3" data-testid="checkout" type="button">Checkout</button>
+    </p>
+
+    <script>
+      document.getElementById('go-to-checkout-v3').addEventListener('click', () => {
+        window.location.href = './checkout.html';
+      });
+    </script>
+  </body>
+</html>

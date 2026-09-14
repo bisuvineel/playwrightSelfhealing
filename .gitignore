@@ -1,0 +1,23 @@
+.env
+node_modules/
+dist/
+healing-records.json
+healing-records.json.lock
+.DS_Store
+*.log
+playwright/.cache
+
+# Playwright reporter output (see reporter[] in playwright.config.ts)
+playwright-report/
+blob-report/
+test-results/
+test-results.json
+
+# Packed tarballs (build output — share them, don't commit them)
+*.tgz
+
+# HEALER_PRIVACY_PREVIEW output. Holds the page content a heal would have sent —
+# redacted, but redaction is what you are inspecting, so never commit it.
+privacy-preview/
+
+settings.json

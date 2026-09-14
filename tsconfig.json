@@ -1,0 +1,35 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    // "DOM" is required to type the callbacks passed to page.evaluate(), which run
+    // in the browser and reference `document`. Node code must still not touch
+    // browser globals — they are typed here, but absent at runtime.
+    "lib": ["ES2020", "DOM"],
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true,
+    // Keeps dead code from accumulating in a published library.
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    // An optional property must be ABSENT, never explicitly `undefined`. The whole
+    // codebase already writes `...(x !== undefined ? { x } : {})` for exactly this, and
+    // three provider comments cited this flag as the reason — while it was switched off,
+    // so nothing enforced it. The distinction is load-bearing: `IntentVerifier` treats a
+    // missing `expectedRole` as "the model did not say" and `PrivacyGuard.sanitizeRequest`
+    // rebuilds each field conditionally, so an explicit `undefined` leaking in would
+    // quietly change which branch runs.
+    "exactOptionalPropertyTypes": true,
+    // Indexing an array or a regex match yields `T | undefined`. Nearly every such read
+    // here is already guarded — this makes the guards required rather than habitual.
+    "noUncheckedIndexedAccess": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "sourceMap": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "tests", "dist"]
+}

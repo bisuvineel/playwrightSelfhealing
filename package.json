@@ -1,0 +1,77 @@
+{
+  "name": "self-healing-playwright",
+  "version": "0.4.4",
+  "description": "AI-powered self-healing Playwright test framework",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./reporter": {
+      "types": "./dist/reporters/HealingReporter.d.ts",
+      "require": "./dist/reporters/HealingReporter.js",
+      "default": "./dist/reporters/HealingReporter.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    ".env.example",
+    "LICENSE",
+    "README.md",
+    "INTEGRATION.md",
+    "ARCHITECTURE.md",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "test": "playwright test",
+    "test:unit": "npm run build && node --test \"tests/unit/*.test.js\"",
+    "test:report": "playwright test tests/report-example.spec.ts",
+    "test:ci": "npm run build && npm run typecheck:demo && npm run test:unit",
+    "typecheck:demo": "tsc --project tsconfig.demo.json",
+    "check:setup": "node scripts/check-setup.js",
+    "check:key": "node scripts/check-setup.js --call",
+    "prepack": "npm run clean && npm run build",
+    "package": "npm pack",
+    "verify:package": "node scripts/verify-package.js"
+  },
+  "keywords": [
+    "playwright",
+    "testing",
+    "self-healing",
+    "ai",
+    "claude",
+    "openai",
+    "gemini",
+    "test-automation"
+  ],
+  "license": "MIT",
+  "author": "Vineel Bisu",
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "@playwright/test": ">=1.53 <2"
+  },
+  "peerDependenciesMeta": {
+    "@playwright/test": {
+      "optional": false
+    }
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "@types/node": "^26.2.0",
+    "typescript": "^5.9.3"
+  }
+}

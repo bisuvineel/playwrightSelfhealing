@@ -1,0 +1,4 @@
+# Normalise line endings so the same tarball behaves identically on every platform.
+* text=auto eol=lf
+*.png binary
+*.tgz binary
