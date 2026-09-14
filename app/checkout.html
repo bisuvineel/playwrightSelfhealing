@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Demo Shop — Checkout</title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; }
+      label { display: block; margin-top: 1rem; }
+      input[type='text'], input[type='email'] { width: 20rem; padding: 0.4rem; }
+      button { padding: 0.5rem 1rem; margin-top: 1.5rem; }
+      #confirmation { color: #0a7a2f; font-weight: bold; }
+    </style>
+  </head>
+  <body>
+    <h1>Checkout</h1>
+
+    <form id="checkout-form-v3">
+      <!-- Renamed in the redesign: was #email-input, now #customer-email-v3. -->
+      <label for="customer-email-v3">Email address</label>
+      <input id="customer-email-v3" name="email" type="email" data-testid="email" />
+
+      <!-- Renamed: was #promo-field, now #promotion-code-v3. -->
+      <label for="promotion-code-v3">Promotion code</label>
+      <input id="promotion-code-v3" name="promo" type="text" data-testid="promo" />
+
+      <label>
+        <input id="terms-v3" type="checkbox" data-testid="terms" />
+        I accept the terms and conditions
+      </label>
+
+      <!-- Renamed: was #place-order-btn, now #submit-order-v3. -->
+      <button id="submit-order-v3" data-testid="place-order" type="button">Place order</button>
+      <button id="cancel-v3" type="button">Cancel</button>
+    </form>
+
+    <p id="confirmation" hidden>Order placed — thank you!</p>
+
+    <script>
+      document.getElementById('submit-order-v3').addEventListener('click', () => {
+        const email = document.getElementById('customer-email-v3').value;
+        const accepted = document.getElementById('terms-v3').checked;
+
+        if (!email || !accepted) {
+          alert('Email and terms are required');
+          return;
+        }
+        document.getElementById('confirmation').hidden = false;
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,33 @@
+{
+  "_comment": [
+    "Per-million-token prices used only by check-setup.js for its cost estimate.",
+    "These drift. The estimate is the number people use to decide whether to run a",
+    "suite, so a stale figure is worse than no figure \u2014 check-setup prints",
+    "lastVerified beside every estimate, and warns once the figures are old enough",
+    "to be worth re-checking.",
+    "",
+    "To update: confirm against the provider's own pricing page, correct the numbers,",
+    "and move lastVerified to today."
+  ],
+  "lastVerified": "2026-08-24",
+  "staleAfterDays": 120,
+  "currency": "USD",
+  "perHealTokens": {
+    "input": 700,
+    "output": 90
+  },
+  "models": {
+    "claude-haiku-4-5": {
+      "input": 1,
+      "output": 5
+    },
+    "claude-sonnet-5": {
+      "input": 3,
+      "output": 15
+    },
+    "claude-opus-5": {
+      "input": 5,
+      "output": 25
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  // Type-checks the demo suite: fixtures, page objects, specs and this project's config.
+  // Separate from tsconfig.json because none of it is compiled into dist or shipped —
+  // `files` in package.json covers dist, src and the docs only.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": ["fixtures.ts", "playwright.config.ts", "pages/**/*", "support/**/*", "tests/**/*", "src/**/*"]
+}
