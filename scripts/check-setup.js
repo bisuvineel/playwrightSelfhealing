@@ -134,6 +134,33 @@ function main() {
       : 'disabled'
   );
 
+  // Healing runs only after an action fails, so it needs an action timeout shorter than the
+  // test timeout. Playwright's default actionTimeout is 0 — wait for the whole test — and
+  // with it no heal ever runs. Read from the config's text rather than by loading it: a
+  // TypeScript config cannot be required from here, and this check must stay free.
+  console.log('\ntimeouts');
+  const configFile = ['playwright.config.ts', 'playwright.config.js', 'playwright.config.mjs', 'playwright.config.cjs']
+    .map((name) => path.join(process.cwd(), name))
+    .find((file) => fs.existsSync(file));
+  if (!configFile) {
+    line('playwright config', `not found in ${process.cwd()}`);
+  } else {
+    const source = fs.readFileSync(configFile, 'utf8');
+    line('playwright config', path.relative(process.cwd(), configFile));
+    line(
+      'actionTimeout',
+      /\bactionTimeout\s*:/.test(source)
+        ? 'set'
+        : 'NOT SET — actions wait for the whole test timeout, so healing never runs;' +
+            ' add use: { actionTimeout: 5_000 }'
+    );
+  }
+  line(
+    'heal adds up to',
+    `${config.healing.maxRetries} × ${config.healing.timeout}ms per stale selector` +
+      '  (capped at the time left in the test)'
+  );
+
   const provider = config.healing.provider;
   const section = provider === 'anthropic' ? config.anthropic : config[provider];
   const model = section?.model ?? '(unknown)';
@@ -209,6 +236,23 @@ function main() {
   }
   line('endpoint', `${process.env.ANTHROPIC_BASE_URL ?? 'https://api.anthropic.com/v1'}/messages`);
 
+  // Certificate trust is the other half of "the network is in the way", and on a corporate
+  // machine the likelier half. A network that inspects HTTPS re-signs it with its own root
+  // certificate; browsers and curl trust that through the operating system, Node trusts only
+  // its bundled list. Reported up front so a failure below can be read against it.
+  const systemCa =
+    process.execArgv.includes('--use-system-ca') ||
+    /(^|\s)--use-system-ca(\s|$)/.test(process.env.NODE_OPTIONS ?? '');
+  const extraCa = process.env.NODE_EXTRA_CA_CERTS;
+  line(
+    'tls trust',
+    systemCa
+      ? 'operating-system store (--use-system-ca)'
+      : extraCa
+        ? `bundled CAs + NODE_EXTRA_CA_CERTS=${extraCa}`
+        : "Node's bundled CAs only — fails behind HTTPS inspection"
+  );
+
   // 6. Optionally prove the credential works.
   if (!WANTS_CALL) {
     console.log('\nNo API call was made. Add --call to verify the key with one ~15-token request.\n');
@@ -256,14 +300,43 @@ async function probe(config, model) {
       signal: AbortSignal.timeout(config.healing.timeout),
     });
   } catch (error) {
-    return {
-      ok: false,
-      status: null,
-      verdict:
-        error.name === 'TimeoutError'
-          ? `✘ timed out after ${config.healing.timeout}ms — network or proxy is blocking the request`
-          : `✘ could not connect: ${error.message}`,
-    };
+    // `fetch` rejects with a bare "fetch failed" and hides the reason on `cause`. That
+    // reason is the whole diagnosis: reading only the message, this checker once reported
+    // "could not connect: fetch failed" beside "proxy env: none set", pointing at a proxy
+    // when the real problem was an untrusted certificate.
+    let code;
+    for (let current = error, depth = 0; depth < 4 && current && typeof current === 'object'; depth++) {
+      if (typeof current.code === 'string' && current.code) {
+        code = current.code;
+        break;
+      }
+      current = current.cause;
+    }
+
+    const trust = new Set([
+      'UNABLE_TO_GET_ISSUER_CERT_LOCALLY', 'UNABLE_TO_GET_ISSUER_CERT', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+      'SELF_SIGNED_CERT_IN_CHAIN', 'DEPTH_ZERO_SELF_SIGNED_CERT', 'CERT_UNTRUSTED', 'CERT_HAS_EXPIRED',
+      'ERR_TLS_CERT_ALTNAME_INVALID',
+    ]);
+
+    let verdict;
+    if (error.name === 'TimeoutError') {
+      verdict = `✘ timed out after ${config.healing.timeout}ms — network or proxy is blocking the request`;
+    } else if (code && trust.has(code)) {
+      verdict =
+        `✘ certificate not trusted (${code}). Your network is almost certainly inspecting ` +
+        'HTTPS with its own root certificate, which the OS trusts and Node does not. Re-run ' +
+        'with NODE_OPTIONS=--use-system-ca (Node 22.15+/23.8+), or set NODE_EXTRA_CA_CERTS to ' +
+        "your organisation's root certificate (a .pem file your IT team can provide).";
+    } else if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') {
+      verdict = `✘ could not resolve the host (${code}) — DNS, or a network that requires a proxy`;
+    } else if (code === 'ECONNREFUSED' || code === 'ECONNRESET') {
+      verdict = `✘ connection refused or reset (${code}) — a firewall, or a proxy Node is not using`;
+    } else {
+      verdict = `✘ could not connect: ${error.message}${code ? ` (${code})` : ''}`;
+    }
+
+    return { ok: false, status: null, verdict };
   }
 
   const text = await response.text();

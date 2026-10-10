@@ -25,15 +25,21 @@ const { IntentVerifier } = require('../../dist/core/IntentVerifier');
  * A stand-in for a Playwright locator, exposing only what the verifier reads.
  *
  * @param {string|null} snapshot - What `ariaSnapshot()` resolves to, or null to throw.
+ * @param {Record<string, string>} [attributes] - The element's attributes, read through
+ * `evaluate()`. Omitted, the stub has no `evaluate` at all, as a locator that cannot run
+ * script would not — which must cost the check nothing but the attributes.
  * @returns {object} A locator-shaped stub.
  */
-function locatorStub(snapshot) {
+function locatorStub(snapshot, attributes) {
   const self = {
     first: () => self,
     ariaSnapshot: async () => {
       if (snapshot === null) throw new Error('element detached');
       return snapshot;
     },
+    ...(attributes !== undefined
+      ? { evaluate: async (fn, names) => names.map((name) => attributes[name] ?? null) }
+      : {}),
   };
   return self;
 }
@@ -294,15 +300,76 @@ describe('IntentVerifier — lexical intent', () => {
 
     // The same single token, not matching, must NOT reject — one word is too thin to
     // refuse on, so this falls through to the confidence floor.
-    const notRejected = await enforcing.verify(locatorStub('- button "Cancel"'), {
+    const notRejected = await enforcing.verify(locatorStub('- button "Continue"'), {
       originalSelector: '#checkout-button',
-      suggestedSelector: "getByRole('button', { name: 'Cancel' })",
+      suggestedSelector: "getByRole('button', { name: 'Continue' })",
       action: 'click',
       confidence: 0.95,
     });
 
     assert.equal(notRejected.ok, true, notRejected.reason);
     assert.deepEqual(notRejected.summary.checks, ['confidence-floor']);
+  });
+
+  it('rejects an opposing action however thin the intent — checkout onto Cancel', async () => {
+    // This used to be the example above, and it passed: one word was too thin to refuse
+    // on, and 0.95 cleared the floor. A test that checks out never means Cancel.
+    const verdict = await enforcing.verify(locatorStub('- button "Cancel"'), {
+      originalSelector: '#checkout-button',
+      suggestedSelector: "getByRole('button', { name: 'Cancel' })",
+      action: 'click',
+      confidence: 0.95,
+    });
+
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.reason, /opposing action \(cancel\)/);
+  });
+
+  it('rejects an opposing action that shares an object noun — Delete record for save the record', async () => {
+    // "record" is shared, which was enough to pass before this rule.
+    const named = await enforcing.verify(locatorStub('- button "Delete record"'), {
+      originalSelector: '#save-btn',
+      suggestedSelector: "getByRole('button', { name: 'Delete record' })",
+      action: 'click',
+      description: 'save the record',
+      confidence: 0.95,
+    });
+    assert.equal(named.ok, false);
+    assert.match(named.reason, /opposing action \(delete\)/);
+
+    // The nameless form: a trash icon known only by its test id.
+    const icon = await enforcing.verify(locatorStub('- button', { 'data-testid': 'delete-record' }), {
+      originalSelector: '#save-btn',
+      suggestedSelector: '[data-testid="delete-record"]',
+      action: 'click',
+      description: 'save the record',
+      confidence: 0.95,
+    });
+    assert.equal(icon.ok, false);
+    assert.match(icon.reason, /opposing action \(delete\)/);
+  });
+
+  it('allows an opposing action the test itself names', async () => {
+    const verdict = await enforcing.verify(locatorStub('- button', { 'data-testid': 'delete-record' }), {
+      originalSelector: '#trash-icon',
+      suggestedSelector: '[data-testid="delete-record"]',
+      action: 'click',
+      description: 'delete the record',
+      confidence: 0.9,
+    });
+    assert.equal(verdict.ok, true, verdict.reason);
+  });
+
+  it('verifies a nameless icon by its test id — the close button', async () => {
+    const verdict = await enforcing.verify(locatorStub('- button', { 'data-testid': 'close' }), {
+      originalSelector: '#close-x',
+      suggestedSelector: '[data-testid="close"]',
+      action: 'click',
+      description: 'the close button in the corner',
+      confidence: 0.85,
+    });
+    assert.equal(verdict.ok, true, verdict.reason);
+    assert.ok(verdict.summary.checks.includes('lexical'));
   });
 
   it('does not reject when the selector carries too little evidence', async () => {
@@ -372,7 +439,7 @@ describe('IntentVerifier — evidence must come from the element', () => {
     });
 
     assert.equal(verdict.ok, false);
-    assert.match(verdict.reason, /shares no wording/);
+    assert.match(verdict.reason, /shares no wording|opposing action/);
   });
 
   it('falls back to the selector text only when the element has no name', async () => {
@@ -387,6 +454,123 @@ describe('IntentVerifier — evidence must come from the element', () => {
 
     assert.equal(verdict.ok, true, verdict.reason);
     assert.ok(verdict.summary.checks.includes('lexical'));
+  });
+
+  it("counts the element's own test id when its name is a synonym the check cannot see", async () => {
+    // Measured on the corpus: "Place order" became "Complete purchase" and the correct
+    // heal was rejected, although the element said data-testid="submit" and the test
+    // described "the button that submits the order".
+    const verdict = await enforcing.verify(
+      locatorStub('- button "Complete purchase"', { 'data-testid': 'submit' }),
+      context({ suggestedSelector: "getByRole('button', { name: 'Complete purchase' })" })
+    );
+
+    assert.equal(verdict.ok, true, verdict.reason);
+    assert.ok(verdict.summary.checks.includes('lexical'));
+  });
+
+  it('does not count an id that only restates the name — Cancel with id="order-cancel"', async () => {
+    // The threat the lexical check exists for. `order` must not rescue a button named Cancel.
+    const verdict = await enforcing.verify(
+      locatorStub('- button "Cancel"', { id: 'order-cancel' }),
+      context({ suggestedSelector: "getByRole('button', { name: 'Cancel' })" })
+    );
+
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.reason, /shares no wording|opposing action/);
+  });
+
+  it('admits no identifier at all for an opposing action the intent does not mention', async () => {
+    // An id independent of the name, and about the order — still not enough to heal
+    // "place the order" onto Delete.
+    const verdict = await enforcing.verify(
+      locatorStub('- button "Delete"', { 'data-testid': 'order-actions' }),
+      context({ suggestedSelector: "getByRole('button', { name: 'Delete' })" })
+    );
+
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.reason, /shares no wording|opposing action/);
+  });
+
+  it('does not rescue even a plausible synonym among opposing actions — Cancel → Discard', async () => {
+    // Deliberately conservative: the attributes would say "cancel", and the heal may well
+    // be right, but among destructive names a red test with a reason beats a guess.
+    const verdict = await enforcing.verify(
+      locatorStub('- button "Discard"', { 'data-testid': 'cancel-edit' }),
+      {
+        originalSelector: '#cancel-edit-btn',
+        suggestedSelector: "getByRole('button', { name: 'Discard' })",
+        action: 'click',
+        description: 'cancel the edit',
+        confidence: 0.9,
+      }
+    );
+
+    assert.equal(verdict.ok, false);
+  });
+
+  it('does not count XPath syntax as intent — the tab rename that was rejected', async () => {
+    // Measured on the corpus: `//div[@role='tab'][text()='Customers']` yielded the intent
+    // "customer, role, tab, text", enough words to reject the correct "Clients".
+    const verdict = await enforcing.verify(locatorStub('- tab "Clients"'), {
+      originalSelector: "//div[@role='tab'][text()='Customers']",
+      suggestedSelector: "getByRole('tab', { name: 'Clients' })",
+      action: 'click',
+      description: 'the customers tab',
+      confidence: 0.85,
+    });
+
+    assert.equal(verdict.ok, true, verdict.reason);
+    assert.ok(verdict.summary.checks.includes('role'), 'the explicit @role is the evidence');
+  });
+
+  it("reads an explicit role from the element's own step only", async () => {
+    const onElement = await enforcing.verify(locatorStub('- button "Clients"'), {
+      originalSelector: "//div[@role='tab'][text()='Customers']",
+      suggestedSelector: "getByRole('button', { name: 'Clients' })",
+      action: 'click',
+      confidence: 0.95,
+    });
+    assert.equal(onElement.ok, false);
+    assert.match(onElement.reason, /targets a tab but the suggestion resolves to a button/);
+
+    // `tablist` belongs to the container, not the element, so it implies nothing.
+    const onContainer = await enforcing.verify(locatorStub('- tab "Clients"'), {
+      originalSelector: "//div[@role='tablist']//div[text()='Customers']",
+      suggestedSelector: "getByRole('tab', { name: 'Clients' })",
+      action: 'click',
+      confidence: 0.95,
+    });
+    assert.equal(onContainer.ok, true, onContainer.reason);
+    assert.ok(!onContainer.summary.checks.includes('role'));
+  });
+
+  it('reads the tag of the last XPath or CSS step, not the first', async () => {
+    const verdict = await enforcing.verify(locatorStub('- link "Export"'), {
+      originalSelector: "//main//button[text()='Export PDF']",
+      suggestedSelector: "getByRole('link', { name: 'Export' })",
+      action: 'click',
+      confidence: 0.95,
+    });
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.reason, /targets a button/);
+
+    // `nav a`: the element is the link, not the nav.
+    const css = await enforcing.verify(locatorStub('- link "Reports"'), {
+      originalSelector: 'nav a.reports-link',
+      suggestedSelector: "getByRole('link', { name: 'Reports' })",
+      action: 'click',
+      confidence: 0.95,
+    });
+    assert.equal(css.ok, true, css.reason);
+    assert.ok(css.summary.checks.includes('role'));
+  });
+
+  it('keeps role and name when the attributes cannot be read', async () => {
+    const verdict = await enforcing.verify(locatorStub('- button "Place order"'), context());
+
+    assert.equal(verdict.ok, true, verdict.reason);
+    assert.equal(verdict.summary.name, 'Place order');
   });
 
   it('records that an unreadable element could not be described', async () => {
@@ -453,7 +637,7 @@ describe('IntentVerifier — false-green regression (AUDIT.md finding 2)', () =>
     });
 
     assert.equal(verdict.ok, false);
-    assert.match(verdict.reason, /shares no wording with the intended element/);
+    assert.match(verdict.reason, /shares no wording with the intended element|opposing action/);
   });
 
   it('still accepts healing it to the real order button', async () => {
@@ -465,5 +649,60 @@ describe('IntentVerifier — false-green regression (AUDIT.md finding 2)', () =>
     assert.equal(verdict.ok, true, verdict.reason);
     assert.equal(verdict.summary.role, 'button');
     assert.equal(verdict.summary.name, 'Place order');
+  });
+});
+
+describe('self-consistency — an observation that is not really a role', () => {
+  it('does not reject a text node against a container role the model named', async () => {
+    // From a healing record. Clicking `//li/span[text()='Charter Cloud']` on a menu
+    // built as `<li><a><span>Charter Cloud</span></a></li>`, the model answered
+    // getByText('Charter Cloud', { exact: true }) — which resolved to one visible
+    // element, the right one — and reported expectedRole "listitem", describing the
+    // element by the container it sits in, as a person would. The observed role of a
+    // bare text node is `text`, so the claim could never match and a correct heal was
+    // thrown away.
+    const verdict = await enforcing.verify(locatorStub('- text: Charter Cloud'), {
+        originalSelector: "//li/span[text()='Charter Cloud']",
+        suggestedSelector: "getByText('Charter Cloud', { exact: true })",
+        action: 'click',
+        description: 'Click on Segment Charter Cloud',
+        confidence: 0.9,
+        expectedRole: 'listitem',
+      });
+
+    assert.equal(verdict.ok, true, verdict.reason);
+    assert.ok(
+      !verdict.summary.checks.includes('self-consistency'),
+      'a non-role observation carries no evidence, so it must not be recorded as a check'
+    );
+  });
+
+  it('treats generic, none and presentation the same way', async () => {
+    for (const role of ['generic', 'none', 'presentation']) {
+      const verdict = await enforcing.verify(locatorStub(`- ${role} "Charter Cloud"`), {
+          originalSelector: "//li/span[text()='Charter Cloud']",
+          suggestedSelector: "getByText('Charter Cloud', { exact: true })",
+          action: 'click',
+          confidence: 0.9,
+          expectedRole: 'listitem',
+        });
+      assert.equal(verdict.ok, true, `${role}: ${verdict.reason}`);
+    }
+  });
+
+  it('still catches a real role that contradicts the claim', async () => {
+    // The case this check exists for is untouched: a heal that lands on a textbox after
+    // describing a button observes a real role, and is still refused.
+    const verdict = await enforcing.verify(locatorStub('- textbox "Email"'), {
+        originalSelector: '#place-order-btn',
+        suggestedSelector: "getByRole('textbox', { name: 'Email' })",
+        action: 'click',
+        confidence: 0.95,
+        expectedRole: 'button',
+        expectedName: 'Place order',
+      });
+
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.reason, /described as a button but resolves to a textbox/);
   });
 });

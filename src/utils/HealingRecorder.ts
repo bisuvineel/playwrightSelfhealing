@@ -94,6 +94,30 @@ const LOCK_RETRY_MS = 20;
 const LOCK_JITTER_MS = 20;
 
 /**
+ * Retries for the atomic rename that publishes the file.
+ *
+ * On Windows, replacing a file that something else has open for even a moment fails
+ * with `EPERM` — a virus scanner or the search indexer reading the file this process
+ * just wrote is enough. Observed under a parallel test run:
+ *
+ * ```
+ *   Failed to persist: EPERM: operation not permitted,
+ *     rename 'healing-records.json.32644.tmp' -> 'healing-records.json'
+ * ```
+ *
+ * The failure was caught, logged, and the record lost from the file — silently, because
+ * the run summary is built from annotations rather than from this file. A lost record in
+ * an append-only audit log is the one failure this module cannot shrug off: it is what a
+ * reviewer reads to decide which selector fixes to commit.
+ *
+ * The condition clears in milliseconds, so a few short retries are the whole fix. Kept
+ * deliberately small — this runs on the healing path, and a file that genuinely cannot
+ * be replaced should be reported rather than waited on.
+ */
+const RENAME_RETRIES = 5;
+const RENAME_RETRY_MS = 20;
+
+/**
  * Retained records, newest kept, when no `HEALER_RECORDS_MAX` is set.
  *
  * The file is read, merged and rewritten on **every** heal, so an unbounded file makes each
@@ -434,7 +458,7 @@ export class HealingRecorder {
       // Write-then-rename: a reader either sees the old report or the new one,
       // never a partially written file.
       fs.writeFileSync(temporary, JSON.stringify(report, null, 2), 'utf8');
-      fs.renameSync(temporary, this.filePath);
+      this.publish(temporary);
     } catch (error) {
       this.log.error(`Failed to persist: ${this.describe(error)}`);
 
@@ -551,6 +575,38 @@ export class HealingRecorder {
       record.suggestedSelector,
       record.success,
     ].join('|');
+  }
+
+  /**
+   * Moves the finished temporary file into place, retrying a transient refusal.
+   *
+   * See {@link RENAME_RETRIES} for what goes wrong and why retrying is the whole fix.
+   * Only the last failure is rethrown, to the caller that already knows how to report a
+   * persist failure and clean up the scratch file.
+   *
+   * @param temporary - Path of the file to publish.
+   * @throws Whatever the final attempt threw.
+   */
+  private publish(temporary: string): void {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        fs.renameSync(temporary, this.filePath);
+        if (attempt > 1) {
+          this.log.debug(`Published the records file on attempt ${attempt}.`);
+        }
+        return;
+      } catch (error) {
+        if (attempt >= RENAME_RETRIES) throw error;
+
+        // `EPERM`/`EACCES`/`EBUSY` is something holding the destination open for a
+        // moment. Anything else — a missing directory, a read-only checkout — will not
+        // improve by waiting, so it is reported immediately.
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'EPERM' && code !== 'EACCES' && code !== 'EBUSY') throw error;
+
+        this.sleepSync(RENAME_RETRY_MS);
+      }
+    }
   }
 
   /** Path of the lock file guarding {@link filePath}. */

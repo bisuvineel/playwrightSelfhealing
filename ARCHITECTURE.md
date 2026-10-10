@@ -17,12 +17,18 @@ Four rules shape most of the decisions below.
 2. **When healing fails, the original Playwright error is re-thrown unchanged** — same
    message, same `locator.click:` label, same stack. A failing test must read exactly as
    it would without this package installed.
-3. **A suggestion is not trusted until it resolves on the live DOM *and* looks like the
+3. **The model chooses an element; this package writes the locator.** `CandidateFinder`
+   enumerates the page's addressable elements from the accessibility snapshot and writes
+   a verified locator for each, so the normal answer is an id off a list rather than an
+   expression. Identifying the element is judgment and belongs to the model; honouring
+   ARIA name computation and Playwright's strict mode is mechanical and belongs here.
+   Free-form authoring stays available for elements no candidate can name.
+4. **A suggestion is not trusted until it resolves on the live DOM *and* looks like the
    element the test meant.** The model proposes; the validator decides whether it works,
    and `IntentVerifier` decides whether it is the right one. Resolving to a single
    visible element is not the same as being correct — see
    [Intent verification](#intent-verification).
-4. **Every attempt is recorded, successful or not.** A rejected suggestion and its reason
+5. **Every attempt is recorded, successful or not.** A rejected suggestion and its reason
    are the data you need to tune the threshold — as is an accepted one's reasoning and
    the list of checks that actually had evidence.
 
@@ -30,25 +36,28 @@ Four rules shape most of the decisions below.
 
 | File | Lines | Responsibility |
 |---|---:|---|
-| `core/TestWrapper.ts` | 1063 | Engine lifecycle, page/locator decoration, report publishing, the integration API |
-| `core/HealingEngine.ts` | 803 | Orchestrates one heal: gate → snapshot → redact → ask → validate → verify → record |
-| `core/PrivacyGuard.ts` | 783 | Route policy, redaction, preview writer — the only egress choke point |
-| `config.ts` | 668 | Environment → validated typed config |
-| `core/IntentVerifier.ts` | 558 | Decides whether a healed element is the one the test meant |
-| `core/SelectorCache.ts` | 200 | Per-worker memory of selectors that healed, so rot is paid for once |
-| `core/HealBudget.ts` | 200 | Per-worker spend ceiling and provider circuit breaker |
-| `core/SelectorValidator.ts` | 537 | Parses selector expressions into locators; decides if a suggestion works |
-| `utils/HealingRecorder.ts` | 407 | `healing-records.json` — lock, merge, atomic rename |
-| `core/AiProvider.ts` | 399 | Base class: prompt delegation, JSON extraction, selector sanitising, logging |
-| `types.ts` | 361 | Shared type definitions, no runtime code |
-| `providers/AnthropicProvider.ts` | 348 | Claude, via the Messages API |
-| `providers/GeminiProvider.ts` | 306 | Gemini, via the Generative Language API |
-| `providers/OpenAIProvider.ts` | 283 | OpenAI, via Chat Completions |
-| `utils/DOMSnapshot.ts` | 273 | Page capture: native aria snapshot, DOM-scan fallback |
-| `reporters/HealingReporter.ts` | 207 | Run-level summary |
-| `utils/PromptBuilder.ts` | 204 | The prompts, in one place, shared by all providers |
-| `providers/httpJson.ts` | 201 | Shared HTTP: retries, `retry-after`, timeouts, error-body extraction |
-| `utils/logger.ts` | 70 | Level-filtered, prefixed logging |
+| `core/TestWrapper.ts` | 1665 | Engine lifecycle, page/locator decoration, report publishing, the integration API |
+| `core/HealingEngine.ts` | 1390 | Orchestrates one heal: gate → snapshot → enumerate → redact → ask → resolve → validate → verify → record |
+| `core/SelectorValidator.ts` | 1004 | Parses selector expressions into locators; decides if a suggestion works |
+| `core/PrivacyGuard.ts` | 954 | Route policy, redaction, preview writer — the only egress choke point |
+| `config.ts` | 816 | Environment → validated typed config |
+| `utils/HealingRecorder.ts` | 629 | `healing-records.json` — lock, merge, atomic rename |
+| `core/IntentVerifier.ts` | 564 | Decides whether a healed element is the one the test meant |
+| `core/AiProvider.ts` | 523 | Base class: prompt delegation, JSON extraction, selector sanitising, logging |
+| `types.ts` | 492 | Shared type definitions, no runtime code |
+| `core/CandidateFinder.ts` | 366 | Snapshot → numbered list of addressable elements, each with a locator written here |
+| `core/TestIdCandidates.ts` | 295 | Nameless controls (icon buttons) offered by their test id, which no snapshot carries |
+| `providers/AnthropicProvider.ts` | 354 | Claude, via the Messages API |
+| `reporters/HealingReporter.ts` | 343 | Run-level summary |
+| `utils/PromptBuilder.ts` | 322 | The prompts, in one place, shared by all providers |
+| `providers/OpenAIProvider.ts` | 311 | OpenAI, via Chat Completions |
+| `providers/GeminiProvider.ts` | 310 | Gemini, via the Generative Language API |
+| `utils/DOMSnapshot.ts` | 303 | Page capture: native aria snapshot, DOM-scan fallback |
+| `providers/httpJson.ts` | 263 | Shared HTTP: retries, `retry-after`, timeouts, error-body extraction |
+| `core/SelectorCache.ts` | 331 | Memory of selectors that healed, so rot is paid for once |
+| `core/SharedSelectorStore.ts` | 429 | Run-scoped sharing of heals between workers, with single-flight claims |
+| `core/HealBudget.ts` | 222 | Per-worker spend ceiling and provider circuit breaker |
+| `utils/logger.ts` | 100 | Level-filtered, prefixed logging |
 
 `index.ts` re-exports the public API and nothing else is part of it. Two of these modules
 are gates rather than machinery: `PrivacyGuard` decides what may leave the process, and
@@ -158,19 +167,29 @@ several actions run concurrently on the same locator object.
 ## The heal
 
 ```
+0. known heal for this selector in this worker?  ← see "Known heals" below
+     original still stale (250ms probe) and a cached replacement validates?
+       → act on the replacement; the stale action is never run
 1. action throws
 2. base.step('heal click() on "#x"')            ← visible in report and trace
-3. engine.attemptHealDetailed(page, selector, action, description, error)
+3. engine.attemptHealDetailed(page, selector, action, description, error, { deadline })
 4.   tryCache()                                 ← reuse a selector healed earlier; no network
+     time left before the test's deadline < 3s? → heal-skipped, no call
      getAriaSnapshot(page)                      ← once per heal, not per attempt
 5.   for attempt in 1..HEALER_MAX_RETRIES:
-        buildSystemPrompt() + buildUserPrompt(request)
+        buildSystemPrompt(request) + buildUserPrompt(request)   ← shorter system prompt when candidates are listed
         provider.heal(request)                  ← bounded by withTimeout()
         confidence < threshold  → record, add to feedback, continue
         validateDetailed(suggestion)         ← does it resolve to one usable element?
           invalid              → record reason, add to feedback, continue
-        verifyIntent(suggestion)             ← is it the RIGHT element?
+        verifyIntent(suggestion)             ← is it the RIGHT element? (action, injection,
+                                               role, contrast, opposing action, wording)
           mismatch             → record reason, add to feedback, continue
+          wording-only mismatch → decided by the second opinion below, when available
+        confirmChoice(suggestion)            ← second opinion (HEALER_CONFIRM_MODEL):
+                                               same control renamed, or a different one?
+          different / error    → record reason, add to feedback, continue
+        late re-check of the original         ← began resolving? the page was slow: no heal
           verified             → record success, return outcome
 6. publishOutcome(outcome)                      ← annotations + attachment
 7. healed?    resolve(healed) → retry the SAME method with the SAME args
@@ -180,6 +199,36 @@ several actions run concurrently on the same locator object.
 `attemptHeal()` returns `string | null` for callers who just want a selector;
 `attemptHealDetailed()` returns the full `HealOutcome` and is what the wrapper uses,
 because a report needs the attempts, confidences, reasons and token counts.
+
+### The test's deadline
+
+A heal runs inside the test's timeout, and could previously outlast it: two retries at
+`HEALER_TIMEOUT=30000` on a 30-second test killed the heal mid-flight and reported
+`Test timeout exceeded`, which names nothing, in place of the error naming the stale
+selector. The wrapper therefore passes a `deadline`: the test's start, plus
+`testInfo.timeout` read at heal time (so `test.slow()` and `test.setTimeout()` count),
+less 2 s for the retried action.
+
+`TestInfo` has no start time, so the wrapper records one at the first decoration of each
+test. That happens during fixture setup, which Playwright already counts against the test,
+so the estimate is slightly late — it can only allow a heal, never refuse one it should
+have made. A page decorated in one test and used in the next (a worker-scoped page) gets
+no deadline rather than an expired one.
+
+Given a deadline, the engine:
+
+- skips the heal as `heal-skipped` when less than 3 s is left after the cache — a
+  3-7 s call could only be cut off;
+- caps the snapshot and each provider call at the time left;
+- does **not** count a call cut short by the deadline toward the breaker. The provider may
+  have been about to answer, and a tight test timeout must not switch healing off for the
+  worker.
+
+The deadline cannot help when `actionTimeout` is `0`, Playwright's default, because then
+the stale action itself consumes the whole test timeout before any heal begins. The
+fixtures read the effective `actionTimeout` (the fixture value, so `test.use()` overrides
+count; `attachHealing` falls back to the project config) and warn once per worker when it
+is unset.
 
 Reporting is published **by the wrapper**, not wired through the engine constructor. An
 earlier version passed an `onOutcome` callback at construction, which meant an engine
@@ -667,7 +716,8 @@ otherwise paid for once per test. Measured on the demo — five distinct selecto
 tests — the cache takes the run from **11 provider calls to 5**, and tokens from
 7,700/990 to 3,500/450.
 
-`core/SelectorCache.ts` is per-worker and in-memory. It sits in the heal loop after the
+`core/SelectorCache.ts` is in-memory per worker, backed within one run by
+`core/SharedSelectorStore.ts` (below). It sits in the heal loop after the
 privacy gate and **before the snapshot**, because capturing the page is itself a browser
 round trip:
 
@@ -678,6 +728,7 @@ round trip:
         probeValidator.validate   ← 250ms timeout, not the validator's 1s
         verifyIntent
         pass → record as provider 'cache', return
+1c'. claim(selector)               ← another worker healing it? wait (≤20s), tryCache again
 2.  getAriaSnapshot
 …
 6.  accept → cache.remember()     ← only after validation AND intent passed
@@ -697,6 +748,28 @@ are probed before the provider is contacted, so the miss path has to stay cheap 
 cache to be worth having; the page has already had an action time out against it, so
 anything present is present.
 
+### Known heals skip the wait
+
+The cache used to save the provider call and nothing else. Each later use of a stale
+locator still ran its action to the full `actionTimeout` before the heal path began, so a
+page-object locator used thirty times in a run cost thirty timeouts.
+
+So before running an action, the wrapper asks `engine.hasKnownHeal(selector)` — a
+synchronous lookup of this worker's own cache, with no file read, because it runs before
+every action on every locator. When the answer is yes, `reuseKnownHeal()` runs the same
+250 ms staleness probe the heal loop opens with. If the original is still stale, it
+applies the privacy gate, then tries the cached candidates through `tryCache`. On a hit, the
+replacement is used and the stale action is never run. On anything else — the original
+resolves again, a blocked route, no candidate fits — it returns `null` having published
+nothing, and the action runs as written, as before.
+
+Measured against a real browser with a 2 s action timeout, three uses of one stale
+selector: 2,615 / 291 / 301 ms, against about 2,500 ms each without it.
+
+A heal another worker made is not known here until this worker has met it once through
+the normal path; reading the shared store before every action would cost a file read per
+action.
+
 ### Why the key is the selector alone
 
 Not `(selector, action)` — a field healed for `fill` is the same element when later
@@ -708,21 +781,42 @@ selector**, most-recent-success first. A selector meaning different things on tw
 then has both answers cached and validation picks; a single entry keyed too loosely would
 thrash between them, and every thrash is a full provider call.
 
-### Two extensions left out on purpose
+### Shared within a run, with single-flight
+
+Workers of one Playwright run share heals through files under
+`os.tmpdir()/self-healing-playwright/run-<id>`. The id is set by the reporter in the runner
+process (`HEALER_RUN_ID`, inherited by every worker; the runner's pid is the fallback), and
+the reporter deletes the directory when the run ends. Outside a Playwright worker the
+store does not exist. Writes are atomic (temp file + rename), and every failure degrades
+to a normal heal.
+
+Sharing alone saved little, because duplicate heals are **concurrent**: measured on the
+demo, they finished within 0.1–1.8 s of each other. So after a miss the first worker
+*claims* the selector (an exclusively created `.claim` file) and the others wait —
+bounded by 20 s or the provider timeout — for a **new** answer, which they still validate
+and intent-check on their own page. A claim released without an answer, or a wait that
+times out, falls through to a normal heal; a claim older than 90 s belongs to a dead
+worker and is taken over.
+
+| Demo, 4 workers, 13 heals of 7 distinct selectors | Provider calls |
+|---|---|
+| per-worker cache | 12 |
+| + shared store | 11 |
+| + single-flight claims | 7 |
+
+### Left out on purpose
 
 - **A committed `selector-map.json`.** It would turn a recurring cost into a one-off and
   also into a maintenance trap: page objects rot indefinitely while a JSON file papers
   over them. That fights the reporter and `HEALER_FAIL_ON_HEAL`, which both exist to push
-  the fix into the source. Making rot free removes the incentive to fix it.
-- **Cross-worker sharing.** It needs a lock file and a run-scoped lifecycle to avoid
-  becoming the stale map above, and saves the first heal per *worker* rather than per
-  *test* — small gain, real complexity.
+  the fix into the source. Making rot free removes the incentive to fix it. The shared
+  store is deleted at the end of every run for the same reason.
 
 ### Measured interactions
 
 | Setting | Effect on the cache |
 |---|---|
-| Parallel workers | Per-worker, so a small suite across many workers shares less. The demo at default parallelism made 9 calls rather than 5. |
+| Parallel workers | Shared within the run: one provider call per distinct stale selector, however many workers hit it. |
 | `HEALER_FAIL_ON_HEAL` | Largely defeats it — **Playwright discards a worker after a failed test**, so each gated failure starts cold. Verified by counting module loads: 2 with the gate off, 4 with it on. Acceptable: the gated run is the one that hands over the edits. |
 
 A reuse is still a heal everywhere it matters — annotation, records file, reporter rewrite

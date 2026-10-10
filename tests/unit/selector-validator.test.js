@@ -246,8 +246,9 @@ describe('resolve — a chain it cannot express is refused, never truncated', ()
     "getByRole('row').filter({ hasText: 'Smith' }).getByRole('button')",
     "getByRole('button', { name: 'Pay' }).filter({ visible: true })",
     "getByText('x').locator('..')",
-    "getByRole('listitem').nth(2).getByRole('link')",
     "locator('.row').filter({ hasText: 'x' })",
+    "getByRole('row').and(page.getByRole('button'))",
+    "getByRole('row').or(page.getByRole('button'))",
   ];
 
   for (const chain of chains) {
@@ -452,5 +453,214 @@ describe('validateMultiple — first candidate that works', () => {
     const locator = { first: () => locator, waitFor: async () => {}, count: async () => 0, isVisible: async () => true };
     const winner = await quiet(() => validator.validateMultiple(['#a', '#b'], { locator: () => locator }));
     assert.equal(winner, null);
+  });
+});
+
+describe('validateDetailed — why a getByRole miss was a miss', () => {
+  /**
+   * A page stub whose getByRole() locator always matches nothing.
+   *
+   * The count is what matters here: the hint under test is only reached after the
+   * expression has already resolved to zero elements, so a real page carrying an
+   * aria-labelled container never sees it.
+   *
+   * @returns {object} The stub page.
+   */
+  function pageMatchingNothing() {
+    const locator = {
+      first: () => locator,
+      waitFor: async () => {},
+      count: async () => 0,
+      isVisible: async () => false,
+    };
+    const root = {
+      getByRole: () => locator,
+      getByText: () => locator,
+      locator: () => locator,
+      frameLocator: () => root,
+    };
+    return root;
+  }
+
+  it('explains a name paired with a container role, which is why nav heals failed', async () => {
+    // The real failure: `//li/a/span[text()='Charter Cloud']` healed to
+    // getByRole('listitem', { name: 'Private Cloud' }) — right element, wrong role.
+    const result = await quiet(() =>
+      validator.validateDetailed("getByRole('listitem', { name: 'Private Cloud' })", pageMatchingNothing())
+    );
+
+    assert.equal(result.valid, false);
+    assert.equal(result.matches, 0);
+    assert.match(result.reason, /matched no elements/);
+    assert.match(result.reason, /takes no accessible name from its contents/);
+    assert.ok(result.reason.includes('Private Cloud'), 'should quote the name that excluded it');
+    assert.match(result.reason, /link, button/, 'should point at the roles that do carry a name');
+  });
+
+  it('says nothing extra when the role does take a name from its contents', async () => {
+    const result = await quiet(() =>
+      validator.validateDetailed("getByRole('link', { name: 'Private Cloud' })", pageMatchingNothing())
+    );
+
+    assert.equal(result.valid, false);
+    assert.equal(result.reason, 'matched no elements');
+  });
+
+  it('says nothing extra when no name was given — the role alone is legitimate', async () => {
+    const result = await quiet(() =>
+      validator.validateDetailed("getByRole('listitem')", pageMatchingNothing())
+    );
+
+    assert.equal(result.reason, 'matched no elements');
+  });
+
+  it('sees through await, page. and frameLocator wrappers', async () => {
+    const result = await quiet(() =>
+      validator.validateDetailed(
+        "await page.frameLocator('#shell').getByRole('navigation', { name: 'Reports' })",
+        pageMatchingNothing()
+      )
+    );
+
+    assert.match(result.reason, /takes no accessible name/);
+  });
+
+  it('reads a regex name too', async () => {
+    const result = await quiet(() =>
+      validator.validateDetailed("getByRole('region', { name: /Summary/i })", pageMatchingNothing())
+    );
+
+    assert.match(result.reason, /takes no accessible name/);
+    assert.ok(result.reason.includes('/Summary/i'));
+  });
+
+  it('leaves non-getByRole misses alone', async () => {
+    const result = await quiet(() =>
+      validator.validateDetailed("getByText('Charter Cloud', { exact: true })", pageMatchingNothing())
+    );
+
+    assert.equal(result.reason, 'matched no elements');
+  });
+});
+
+describe('resolve — a scoping chain of getBy* calls', () => {
+  /**
+   * A stub whose locators are themselves builders, so a chain can be recorded.
+   *
+   * `Locator` exposes the same builder surface as `Page`, which is exactly what makes
+   * chaining resolvable rather than a special case.
+   *
+   * @returns {object} The stub, with a flat `calls` log of `method(args)` at each depth.
+   */
+  function chainStub() {
+    const calls = [];
+
+    /**
+     * @param {number} depth - How deep in the chain this level sits.
+     * @returns {object} A builder that logs and returns the next level.
+     */
+    function level(depth) {
+      const node = {
+        __depth: depth,
+        first: () => (calls.push(`${depth}:first`), node),
+        last: () => (calls.push(`${depth}:last`), node),
+        nth: (n) => (calls.push(`${depth}:nth(${n})`), node),
+      };
+      for (const method of [
+        'locator', 'getByRole', 'getByLabel', 'getByText',
+        'getByPlaceholder', 'getByTestId', 'getByTitle', 'getByAltText',
+      ]) {
+        node[method] = (...args) => {
+          calls.push(`${depth}:${method}(${args.map((a) => JSON.stringify(a)).join(', ')})`);
+          return level(depth + 1);
+        };
+      }
+      node.frameLocator = () => node;
+      return node;
+    }
+
+    const page = level(0);
+    page.calls = calls;
+    return page;
+  }
+
+  it('resolves the scoped form CandidateFinder writes for a repeated name', () => {
+    // Two links named "Settings" under different landmarks have no other unique
+    // expression, so refusing this shape refused the whole class of duplicate names.
+    const page = chainStub();
+    const result = quiet(() =>
+      validator.resolve(
+        "getByRole('navigation', { name: 'Account' }).getByRole('link', { name: 'Settings', exact: true })",
+        page
+      )
+    );
+
+    assert.ok(result, 'the chain should resolve');
+    assert.deepEqual(page.calls, [
+      '0:getByRole("navigation", {"name":"Account"})',
+      '1:getByRole("link", {"name":"Settings","exact":true})',
+    ]);
+  });
+
+  it('binds a refinement to the segment it follows, not to the whole chain', () => {
+    // `.nth(2)` here means the third listitem, then the link inside it. Applying it at
+    // the end instead would take the third *link*, which is a different element.
+    const page = chainStub();
+    quiet(() => validator.resolve("getByRole('listitem').nth(2).getByRole('link')", page));
+
+    // Depths are the node each call was made *on*: the listitem locator is level 1, so
+    // `nth(2)` narrowing it — and the link being built from the narrowed result — is
+    // exactly the binding this asserts.
+    assert.deepEqual(page.calls, [
+      '0:getByRole("listitem", {})',
+      '1:nth(2)',
+      '1:getByRole("link", {})',
+    ]);
+  });
+
+  it('walks three levels deep', () => {
+    const page = chainStub();
+    quiet(() =>
+      validator.resolve(
+        "getByRole('table').getByRole('row', { name: 'Smith' }).getByRole('cell', { name: 'Active' })",
+        page
+      )
+    );
+    assert.equal(page.calls.length, 3);
+  });
+
+  it('still refuses a chain it would resolve differently from Playwright', () => {
+    for (const chain of [
+      "getByRole('row').filter({ hasText: 'x' }).getByRole('button')",
+      "getByRole('row').getByRole('cell').filter({ hasText: 'x' })",
+      "getByText('x').locator('..')",
+    ]) {
+      assert.equal(quiet(() => validator.resolve(chain, chainStub())), null, chain);
+      assert.ok(validator.unsupportedSuffix(chain), `${chain}: the suffix should be named`);
+    }
+  });
+
+  it('keeps the leading dot on the suffix it refuses, at any depth', () => {
+    // The reason reaches a model as the text to stop writing, so it has to read as code.
+    assert.equal(
+      validator.unsupportedSuffix("getByRole('row').getByRole('cell').filter({ hasText: 'x' })"),
+      ".filter({ hasText: 'x' })"
+    );
+  });
+
+  it('checks unhonoured options in every segment, not just the first', () => {
+    // An option dropped from a scoping call resolves a broader scope — the same
+    // failure as a truncated chain, one level out.
+    const offenders = validator.unhonouredOptions(
+      "getByRole('row', { name: 'Smith' }).getByRole('button', { pressed: true })"
+    );
+    assert.deepEqual(offenders, ['pressed']);
+  });
+
+  it('accepts a chain as syntactically valid', () => {
+    assert.equal(
+      validator.isValidSyntax("getByRole('navigation', { name: 'A' }).getByRole('link', { name: 'B' })"),
+      true
+    );
   });
 });

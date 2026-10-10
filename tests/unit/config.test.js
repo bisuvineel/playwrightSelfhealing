@@ -29,6 +29,7 @@ const OWNED = [
   'HEALER_TIMEOUT', 'HEALER_CACHE', 'HEALER_FAIL_ON_HEAL', 'HEALER_REDACT',
   'HEALER_REDACT_PATTERNS_FILE', 'HEALER_ALLOWED_ORIGINS', 'HEALER_BLOCKED_PATHS',
   'HEALER_SNAPSHOT_ROOT', 'HEALER_PRIVACY_PREVIEW', 'HEALER_INTENT_CHECK',
+  'HEALER_CANDIDATES', 'HEALER_MAX_SNAPSHOT_CHARS',
   'HEALER_UNVERIFIED_CONFIDENCE', 'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL',
   'OPENAI_API_KEY', 'GEMINI_API_KEY', 'BROWSER', 'HEADLESS', 'SHOW_BROWSER', 'LOG_LEVEL',
 ];
@@ -87,7 +88,9 @@ describe('the strict defaults', () => {
     assert.equal(config.healing.threshold, 0.7);
     assert.equal(config.healing.maxRetries, 2);
     assert.equal(config.healing.timeout, 30000);
-    assert.equal(config.anthropic.model, 'claude-haiku-4-5');
+    // The dated snapshot rather than the alias, so heal decisions do not change on an
+    // unchanged commit when the alias moves.
+    assert.equal(config.anthropic.model, 'claude-haiku-4-5-20251001');
   });
 });
 
@@ -302,7 +305,7 @@ describe('the cheap accessors', () => {
     assert.equal(isHealingEnabled(), true);
     assert.equal(isFailOnHeal(), false);
     assert.equal(getProviderType(), 'anthropic');
-    assert.equal(getModel('anthropic'), 'claude-haiku-4-5');
+    assert.equal(getModel('anthropic'), 'claude-haiku-4-5-20251001');
 
     // The broken value still fails the full load, so it is not being ignored.
     assert.throws(() => getConfig(), ConfigError);
@@ -352,5 +355,34 @@ describe('preview mode through the programmatic API', () => {
 
     assert.ok(engine);
     assert.equal(engine.privacy.previewOnly, true);
+  });
+});
+
+describe('HEALER_CANDIDATES — the switch back to free-form authoring', () => {
+  it('defaults to on, because it is what stops a correct answer becoming a bad locator', () => {
+    assert.equal(getConfig().healing.candidates, true);
+  });
+
+  it('can be turned off without downgrading the package', () => {
+    process.env.HEALER_CANDIDATES = 'false';
+    assert.equal(getConfig().healing.candidates, false);
+  });
+});
+
+describe('HEALER_MAX_SNAPSHOT_CHARS — the cost ceiling', () => {
+  it('has a default, rather than leaving a data grid unbounded', () => {
+    // Unbounded, a 2,000-row table sent about 83,000 input tokens per attempt, and a
+    // larger one exceeded the model's context — which counts against the breaker.
+    assert.equal(getConfig().healing.maxSnapshotChars, 40_000);
+  });
+
+  it('treats 0 as unlimited', () => {
+    process.env.HEALER_MAX_SNAPSHOT_CHARS = '0';
+    assert.equal(getConfig().healing.maxSnapshotChars, 0);
+  });
+
+  it('refuses a value that is not a number, naming the variable', () => {
+    process.env.HEALER_MAX_SNAPSHOT_CHARS = 'lots';
+    assert.throws(() => getConfig(), /HEALER_MAX_SNAPSHOT_CHARS/);
   });
 });

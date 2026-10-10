@@ -539,3 +539,194 @@ describe('cancellation — one deadline governs the whole chain', () => {
     assert.equal(result.suggestedSelector, '#ok');
   });
 });
+
+describe('every provider carries a candidate pick through', () => {
+  // The regression this exists for: all three providers threw unless the model wrote a
+  // selector, and dropped candidateId and alternatives when assembling the response. So
+  // the moment the prompt started asking for an id — the normal case — every heal failed
+  // at the provider, *and* threw, which the engine counts against the circuit breaker as
+  // though the API were down. Stubbed-provider tests cannot see this; these go through
+  // the real heal() path.
+
+  /** The answer shape a model now returns when it picks off the candidate list. */
+  const PICK = {
+    candidateId: 12,
+    confidence: 0.95,
+    reasoning: 'the renamed menu item',
+    alternatives: [{ candidateId: 7, confidence: 0.6, reasoning: 'second guess' }],
+  };
+
+  /**
+   * Wraps a model answer in each provider's own envelope.
+   *
+   * @param {object} answer - The JSON the model returns.
+   * @returns {object} Bodies keyed by provider name.
+   */
+  const envelopes = (answer) => ({
+    anthropic: JSON.stringify({
+      content: [{ type: 'text', text: JSON.stringify(answer) }],
+      usage: { input_tokens: 100, output_tokens: 20 },
+      stop_reason: 'end_turn',
+    }),
+    openai: JSON.stringify({
+      choices: [{ message: { content: JSON.stringify(answer) }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 100, completion_tokens: 20 },
+    }),
+    gemini: JSON.stringify({
+      candidates: [{ content: { parts: [{ text: JSON.stringify(answer) }] }, finishReason: 'STOP' }],
+      usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 20 },
+    }),
+  });
+
+  for (const [name, build] of [
+    ['anthropic', anthropic],
+    ['openai', openai],
+    ['gemini', gemini],
+  ]) {
+    it(`${name} returns the pick rather than throwing`, async () => {
+      expectReply({ status: 200, body: envelopes(PICK)[name] });
+
+      const result = await quiet(() => build().heal(request()));
+
+      assert.equal(result.candidateId, 12);
+      assert.equal(result.confidence, 0.95);
+      assert.equal(result.suggestedSelector, '', 'no selector was written, and none is invented');
+      assert.equal(result.alternatives.length, 1);
+      assert.equal(result.alternatives[0].candidateId, 7);
+    });
+
+    it(`${name} still carries a written selector and its alternatives`, async () => {
+      expectReply({
+        status: 200,
+        body: envelopes({
+          suggestedSelector: "getByTestId('close')",
+          expectedRole: 'button',
+          confidence: 0.8,
+          reasoning: 'no candidate names this element',
+          alternatives: [{ suggestedSelector: "locator('#close-x')", confidence: 0.4, reasoning: 'by id' }],
+        })[name],
+      });
+
+      const result = await quiet(() => build().heal(request()));
+
+      assert.equal(result.suggestedSelector, "getByTestId('close')");
+      assert.equal(result.candidateId, undefined);
+      assert.equal(result.alternatives[0].suggestedSelector, "locator('#close-x')");
+    });
+
+    it(`${name} returns a refusal as an answer, not as a failure`, async () => {
+      // The prompt asks for exactly this when nothing matches, and the real
+      // claude-haiku-4-5 gave it three runs out of three on a renamed menu with two
+      // equally plausible successors. Throwing on it counted a careful answer as an
+      // outage: three refusals opened the breaker, and the tokens were never recorded.
+      expectReply({
+        status: 200,
+        body: envelopes({ confidence: 0, reasoning: 'Nothing on this page is that element.' })[name],
+      });
+
+      const result = await quiet(() => build().heal(request()));
+
+      assert.equal(result.confidence, 0);
+      assert.equal(result.suggestedSelector, '');
+      assert.equal(result.candidateId, undefined);
+      assert.match(result.reasoning, /Nothing on this page/, 'the reasoning is what a human needs');
+      assert.ok(result.tokenUsage.input > 0, 'a refusal was billed, so it must be recorded');
+    });
+
+    it(`${name} still throws when there is no answer at all`, async () => {
+      // Distinct from a refusal: no JSON object means the reply is unusable, which is
+      // what the throw is for.
+      const empty = {
+        anthropic: JSON.stringify({
+          content: [{ type: 'text', text: 'I am sorry, I cannot help with that.' }],
+          usage: { input_tokens: 100, output_tokens: 10 },
+          stop_reason: 'end_turn',
+        }),
+        openai: JSON.stringify({
+          choices: [{ message: { content: 'I am sorry, I cannot help with that.' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 100, completion_tokens: 10 },
+        }),
+        gemini: JSON.stringify({
+          candidates: [{ content: { parts: [{ text: 'I am sorry, I cannot help with that.' }] }, finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 10 },
+        }),
+      };
+      expectReply({ status: 200, body: empty[name] });
+
+      const error = await healError(build());
+      assert.ok(error, 'prose with no JSON object is not an answer');
+      assert.match(error.message, /no usable answer/);
+    });
+  }
+});
+
+describe('a refusal does not trip the circuit breaker', () => {
+  // End to end through the real AnthropicProvider and the real engine. The regression:
+  // with the shipped breaker threshold of 5, three consecutive refusals — three
+  // genuinely-removed elements, an ordinary day after a redesign — opened the breaker,
+  // and the next heal was never attempted on a perfectly healthy provider.
+  const { HealingEngine } = require('../../dist/core/HealingEngine');
+  const { HealBudget } = require('../../dist/core/HealBudget');
+  const { SelectorCache } = require('../../dist/core/SelectorCache');
+
+  /** A page stub that holds nothing the refusal would resolve. */
+  function pageStub() {
+    const locator = {
+      first: () => locator,
+      waitFor: async () => {},
+      count: async () => 0,
+      isVisible: async () => false,
+      ariaSnapshot: async () => '- link "Private Cloud"\n- link "Dedicated Cloud"',
+    };
+    const page = { url: () => 'https://app.test/home' };
+    for (const m of ['locator', 'getByRole', 'getByLabel', 'getByText', 'getByPlaceholder', 'getByTestId', 'getByTitle', 'getByAltText']) {
+      page[m] = () => locator;
+    }
+    page.frameLocator = () => page;
+    return page;
+  }
+
+  it('keeps healing available after repeated honest refusals', async () => {
+    let calls = 0;
+    reply = () => {
+      calls += 1;
+      return {
+        status: 200,
+        body: JSON.stringify({
+          content: [{ type: 'text', text: '```json\n{"confidence": 0, "reasoning": "not on this page"}\n```' }],
+          usage: { input_tokens: 1700, output_tokens: 90 },
+          stop_reason: 'end_turn',
+        }),
+        headers: {},
+      };
+    };
+
+    const budget = new HealBudget({ maxHeals: 0, breakerThreshold: 5 });
+    const engine = new HealingEngine(
+      {
+        enabled: true,
+        maxRetries: 2,
+        timeout: 5_000,
+        provider: 'anthropic',
+        model: 'claude-haiku-4-5',
+        confidenceThreshold: 0.7,
+        privacy: { redact: 'identifiers' },
+        intent: { mode: 'off', unverifiedConfidence: 0.9 },
+        cache: false,
+      },
+      anthropic(),
+      { recorder: { recordHeal() {} }, cache: new SelectorCache(false), budget }
+    );
+
+    for (let i = 0; i < 6; i++) {
+      const outcome = await quiet(() => engine.attemptHealDetailed(pageStub(), `#removed-${i}`, 'click'));
+      assert.equal(outcome.healed, null);
+      assert.match(outcome.error, /the model declined/);
+      assert.ok(outcome.tokens.input > 0, 'the refusal was billed and must be recorded');
+    }
+
+    assert.equal(budget.stats().breakerOpen, false, 'six refusals must not open the breaker');
+    // One call per refusal: an explicit "no" is not retried.
+    assert.equal(calls, 6);
+  });
+});

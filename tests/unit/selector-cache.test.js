@@ -111,7 +111,7 @@ describe('SelectorCache — accounting', () => {
     cache.noteHit('#a', 'x');
     cache.noteMiss('#b');
 
-    assert.deepEqual(cache.stats(), { hits: 1, misses: 1, probes: 1, tracked: 1, evicted: 0 });
+    assert.deepEqual(cache.stats(), { hits: 1, sharedHits: 0, misses: 1, probes: 1, tracked: 1, evicted: 0 });
   });
 
   it('reports the share of heals that avoided a provider call', () => {
@@ -174,7 +174,7 @@ describe('SelectorCache — accounting', () => {
     cache.noteHit('#a', 'x');
     cache.clear();
 
-    assert.deepEqual(cache.stats(), { hits: 0, misses: 0, probes: 0, tracked: 0, evicted: 0 });
+    assert.deepEqual(cache.stats(), { hits: 0, sharedHits: 0, misses: 0, probes: 0, tracked: 0, evicted: 0 });
     assert.deepEqual(cache.candidates('#a'), []);
   });
 });

@@ -126,7 +126,8 @@ yourself.
 The package's own gate, which needs neither a browser nor a credential:
 
 ```bash
-npm run test:ci        # build, type-check, 288 unit tests
+npm run test:ci        # build, type-check, 666 unit + 231 live tests. Chromium, no key
+npm run test:unit      # the unit half alone: no browser, no key, no network
 npm run test:report    # optional: the report tour. A browser, still no key
 ```
 
@@ -321,17 +322,40 @@ under which redaction policy.
 
 ## Timeouts
 
-Healing runs **after** an action fails and spends the same test-timeout budget:
+Healing runs **after** an action fails, so it needs an **`actionTimeout`**. Playwright's
+default is `0`: an action waits for its element until the *test* times out, and a heal
+never gets to run. Set one:
+
+```ts
+// playwright.config.ts
+export default defineConfig({
+  use: { actionTimeout: 5_000 },
+});
+```
+
+The healer warns once per worker when it finds no `actionTimeout`. If you set timeouts
+another way (`page.setDefaultTimeout()`, `context.setDefaultTimeout()`), you can ignore
+the warning.
+
+A heal spends the same test-timeout budget as the action it follows:
 
 ```
 actionTimeout + (HEALER_MAX_RETRIES × HEALER_TIMEOUT) + overhead + the retried action
 ```
 
-With the defaults (`HEALER_TIMEOUT=30000`, `HEALER_MAX_RETRIES=2`) that is roughly 79
-seconds, so a 30-second test timeout would kill a heal mid-flight and report a timeout
-that hides the real failure. Either raise `timeout` in your config or lower
-`HEALER_TIMEOUT` / `HEALER_MAX_RETRIES`. This repo's `playwright.config.ts` takes the
-simpler route of a flat `timeout: 120_000`, because one demo test heals five selectors.
+With the defaults (`HEALER_TIMEOUT=30000`, `HEALER_MAX_RETRIES=2`) that can reach roughly
+79 seconds. Each provider call is therefore capped at the time left in the test, keeping
+2 s back for the retried action. When less than 3 s is left, no call is started: the heal
+is reported as `heal-skipped` and the test fails with the Playwright error naming the
+stale selector, not with `Test timeout exceeded`. A test that heals often still needs
+room, so raise `timeout` or lower `HEALER_TIMEOUT` / `HEALER_MAX_RETRIES`. This repo's
+`playwright.config.ts` uses a flat `timeout: 120_000`, because one demo test heals five
+selectors.
+
+A stale selector pays its `actionTimeout` **once per worker**, not once per use. After
+the first heal, later uses of the same selector check the original for 250 ms and, if it
+is still stale, go straight to the healed replacement. The replacement is re-validated and
+reported as a heal (`via cache`) exactly as before.
 
 ---
 

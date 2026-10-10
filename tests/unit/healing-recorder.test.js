@@ -653,3 +653,82 @@ describe('writing into a directory that does not exist yet', () => {
     assert.ok(elapsed < 1000, `first write took ${elapsed}ms — the lock budget was spent`);
   });
 });
+
+describe('publishing the file through a transient refusal', () => {
+  /**
+   * Replaces `fs.renameSync` with one that fails `times` times before succeeding.
+   *
+   * @param {number} times - How many attempts should fail.
+   * @param {string} code - The errno to fail with.
+   * @returns {Function} A restore function, and a `calls` counter on it.
+   */
+  function failRenames(times, code = 'EPERM') {
+    const real = fs.renameSync;
+    let calls = 0;
+    fs.renameSync = (from, to) => {
+      calls += 1;
+      if (calls <= times) {
+        const error = new Error(`${code}: operation not permitted, rename '${from}' -> '${to}'`);
+        error.code = code;
+        throw error;
+      }
+      return real(from, to);
+    };
+    const restore = () => {
+      fs.renameSync = real;
+    };
+    restore.count = () => calls;
+    return restore;
+  }
+
+  it('does not lose a record when the rename is briefly refused', () => {
+    // Observed for real under a parallel run on Windows: a scanner or the indexer holds
+    // the destination open for a moment and the atomic rename fails with EPERM. The
+    // failure was caught, logged, and the record lost from the file — silently, because
+    // the run summary is built from annotations rather than from this file.
+    const target = file();
+    const restore = failRenames(3);
+    try {
+      const recorder = new HealingRecorder(target, 0);
+      quiet(() => recorder.recordHeal(record({ timestamp: 'kept' })));
+
+      const onDisk = JSON.parse(fs.readFileSync(target, 'utf8')).records;
+      assert.equal(onDisk.length, 1, 'the record must survive a transient refusal');
+      assert.equal(onDisk[0].timestamp, 'kept');
+      assert.equal(restore.count(), 4, 'it should have retried rather than given up');
+    } finally {
+      restore();
+    }
+  });
+
+  it('gives up rather than waiting on a refusal that will not clear', () => {
+    const target = file();
+    const restore = failRenames(Number.MAX_SAFE_INTEGER);
+    try {
+      const recorder = new HealingRecorder(target, 0);
+      // Still never throws at the caller — healing must not fail because a log did.
+      assert.doesNotThrow(() => quiet(() => recorder.recordHeal(record())));
+      assert.equal(fs.existsSync(target), false);
+      // And no scratch file is left behind to confuse the next run.
+      assert.deepEqual(
+        fs.readdirSync(dir).filter((name) => name.endsWith('.tmp')),
+        []
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  it('does not retry an error that waiting cannot fix', () => {
+    // A read-only checkout or a missing directory will not improve, so it is reported
+    // at once rather than costing five sleeps on the healing path.
+    const target = file();
+    const restore = failRenames(Number.MAX_SAFE_INTEGER, 'EROFS');
+    try {
+      quiet(() => new HealingRecorder(target, 0).recordHeal(record()));
+      assert.equal(restore.count(), 1, 'EROFS should not be retried');
+    } finally {
+      restore();
+    }
+  });
+});

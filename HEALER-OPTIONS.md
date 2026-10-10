@@ -29,25 +29,28 @@ Selects which AI backend produces selector suggestions. Accepted values: `anthro
 - `anthropic` — default; best accuracy on DOM reasoning.
 - `openai` — when your org already has an OpenAI contract or Azure OpenAI endpoint.
 - `gemini` — when you need Google's quota tier or are on GCP.
-- `ollama` — air-gapped / on-prem environments, or cost-free local development where accuracy matters less than zero egress.
+- `ollama` — **accepted by the config but not implemented.** Selecting it switches healing off for the run with an error saying so. For an on-prem model, see the [air-gapped recipe](#common-recipes).
 
 ```env
 HEALER_PROVIDER=openai
 OPENAI_API_KEY=sk-...
 OPENAI_MODEL=gpt-4o          # override the default gpt-4o if needed
+# Azure OpenAI: point the base URL at the deployment and set the API version,
+# which is appended as ?api-version= on every call.
 OPENAI_BASE_URL=https://my-azure-endpoint/openai/deployments/gpt-4o
+OPENAI_API_VERSION=2025-01-01-preview
 ```
 
 ### Provider credentials
 
 | Provider | Key var | Model var | Base URL var |
 |----------|---------|-----------|--------------|
-| Anthropic | `ANTHROPIC_API_KEY` | `ANTHROPIC_MODEL` (default `claude-haiku-4-5`) | `ANTHROPIC_BASE_URL` |
+| Anthropic | `ANTHROPIC_API_KEY` | `ANTHROPIC_MODEL` (default `claude-haiku-4-5-20251001`) | `ANTHROPIC_BASE_URL` |
 | OpenAI | `OPENAI_API_KEY` | `OPENAI_MODEL` (default `gpt-4o`) | `OPENAI_BASE_URL` |
 | Gemini | `GEMINI_API_KEY` | `GEMINI_MODEL` (default `gemini-2.0-flash`) | `GEMINI_BASE_URL` |
-| Ollama | — | `OLLAMA_MODEL` (default `llama3.1`) | `OLLAMA_URL` (default `http://localhost:11434`) |
+| Ollama (not implemented) | — | `OLLAMA_MODEL` (default `llama3.1`) | `OLLAMA_URL` (default `http://localhost:11434`) |
 
-**When to change the model:** Switch to a larger model (e.g. `ANTHROPIC_MODEL=claude-opus-5`) when healing fails on complex, deeply-nested UIs; switch to a smaller one to cut cost on high-volume CI runs.
+**When to change the model:** Switch to a larger model (e.g. `ANTHROPIC_MODEL=claude-opus-5-5`) when healing fails on complex, deeply-nested UIs; switch to a smaller one to cut cost on high-volume CI runs.
 
 ---
 
@@ -67,10 +70,10 @@ HEALER_THRESHOLD=0.85
 
 ### `HEALER_MAX_RETRIES` (default: `2`)
 
-How many separate AI calls to attempt before giving up and re-throwing the original error. Each attempt sends a fresh prompt; the engine feeds the previous failure reason into the next prompt.
+How many separate AI calls to attempt before giving up and re-throwing the original error. Each attempt sends a fresh prompt; the engine feeds the previous failure reason into the next prompt. At least one call is always made while healing is on, so `0` behaves as `1`.
 
 **When to use:**
-- Set to `0` or `1` to keep CI fast and costs low when your selectors are mostly stable and a single attempt is usually enough.
+- Set to `1` to keep CI fast and costs low when your selectors are mostly stable and a single attempt is usually enough.
 - Raise to `3` or `4` on apps with highly dynamic or framework-generated class names where the first attempt often misses but the second succeeds after the failure feedback is included.
 
 ```env
@@ -80,6 +83,10 @@ HEALER_MAX_RETRIES=3
 ### `HEALER_TIMEOUT` (default: `30000` ms)
 
 Hard deadline (in milliseconds) for a single provider call. If the call does not return within this window it is cancelled and counted as a failure.
+
+A call is also capped at the time left before the **test's** own timeout, keeping 2 s back for the retried action. With less than 3 s left, no call is started and the heal is reported as `heal-skipped`. The test then fails with the Playwright error naming the stale selector, instead of `Test timeout exceeded`. A call cut short by the test's timeout does not count toward the circuit breaker.
+
+**Healing needs Playwright's `actionTimeout`.** Healing starts only after an action fails. Playwright's default `actionTimeout` is `0`, which means an action waits for the whole test timeout, so no heal ever runs. Set `use: { actionTimeout: 5_000 }` (or similar) in `playwright.config`. The healer warns once per worker when it is unset.
 
 **When to use:**
 - Lower (e.g. `10000`) in latency-sensitive pipelines where you'd rather fail fast than wait 30 s on an overloaded API.
@@ -95,7 +102,11 @@ HEALER_TIMEOUT=15000
 
 ### `HEALER_CACHE` (default: `true`)
 
-Enables per-worker selector memory. When a selector is successfully healed, the mapping is stored in memory for the rest of that worker's lifetime. Subsequent identical failures return the cached result instantly without touching the AI provider.
+Remembers selectors that healed, so the same stale selector is paid for once rather than once per test. Every reused selector is re-validated and re-intent-checked against the live page, and is still reported as a heal (`via cache`), so the CI gate and the reporter see it.
+
+- **Within a worker:** after the first heal of a selector, later uses of it skip the stale original's action timeout. The original gets a quarter-second check, and if it is still stale the cached replacement is used directly.
+- **Across workers of one run:** heals are shared, and a worker that meets a selector another worker is already healing waits for that answer instead of making its own call.
+- **Never across runs:** the shared store is deleted when the run ends, so rot is never made permanently free.
 
 **When to use:**
 - Leave `true` in almost all cases — it cuts cost and latency significantly on tests that visit the same page multiple times.
@@ -111,12 +122,13 @@ HEALER_CACHE=false
 
 ### `HEALER_MAX_HEALS` (default: `100`)
 
-Maximum total heal attempts allowed per test run across all workers. Once this ceiling is reached every subsequent failing locator re-throws immediately.
+Maximum number of provider-backed heals **per worker**. The effective ceiling for a run is this value × your `workers` setting. It counts heals, not calls: one heal that retries three times is charged once. Cache reuses are free and still work once the ceiling is reached. Past the ceiling, a heal that would need the provider is reported as `heal-skipped` and the original error is re-thrown.
+
+**`0` means no ceiling**, not "no healing". To turn healing off, use `HEALER_ENABLED=false`. To see what would be sent without sending anything, use `HEALER_PRIVACY_PREVIEW`.
 
 **When to use:**
 - Set lower (e.g. `20`) for cost control in CI. If a build triggers more than 20 heals something has probably broken badly enough that a human should look at it rather than burning API quota.
 - Set higher (e.g. `500`) during a large-scale locator migration where you expect many selectors to break at once and want the healer to fix them all in one pass.
-- Set to `0` to disable all healing without turning off the feature flag (useful for a dry run to count how many locators would have needed healing).
 
 ```env
 HEALER_MAX_HEALS=25
@@ -124,7 +136,9 @@ HEALER_MAX_HEALS=25
 
 ### `HEALER_BREAKER_THRESHOLD` (default: `5`)
 
-Number of consecutive AI provider *call failures* (network errors, 5xx, timeouts) before the circuit breaker opens. While open, all healing is skipped; the breaker resets at the start of the next test file.
+Number of consecutive AI provider *call failures* (network errors, 5xx, timeouts) before the circuit breaker opens, counted per worker. A low-confidence or rejected answer is not a failure, and any successful call resets the count. Once open, the breaker **stays open for the rest of that worker**: heals that would need the provider are reported as `heal-skipped`, while cache reuses still work. It resets only when Playwright starts a new worker (which it also does after a failed test). `0` disables the breaker.
+
+A configuration failure — a rejected key, an unknown model, an untrusted certificate — does not wait for the threshold: healing stops for the worker at the first one, with the reason in the report.
 
 **When to use:**
 - Lower to `2` or `3` in pipelines where the provider is unreliable and you want tests to fail fast rather than hang on repeated timeouts.
@@ -162,7 +176,16 @@ Controls whether the healer verifies that the suggested element is actually what
 | `warn` | Run intent checks, annotate concerns in the record, but still accept. |
 | `enforce` | Reject suggestions that fail intent checks; feed the failure reason into the next retry prompt. |
 
-The four checks run in order: action compatibility (e.g. `fill()` cannot target a `<button>`), self-consistency (model's stated role vs. actual DOM), role preservation (original selector implied a role — healed element must match), lexical intent (tokens in the old selector name must overlap with the element's accessible name).
+The checks run in order:
+
+1. **Action compatibility:** `fill()` cannot target a `<button>`.
+2. **Instruction-like names:** an element whose name addresses the AI ("note to AI", "ignore your instructions", "answer with") is never a heal.
+3. **Self-consistency:** the model's stated role must match the actual DOM.
+4. **Role preservation:** if the original selector implied a role, the healed element must have it. A subtype counts: a searchbox is a textbox, a switch is a checkbox.
+5. **Contrast:** a name that keeps a word but swaps the word that decides what the control does is rejected — Sign in → Sign up, Pay now → Pay later, Download CSV → Download PDF, Next → Previous.
+6. **Opposing action:** Cancel, Delete, Discard and similar are rejected unless the test's own words mention such an action.
+7. **Lexical intent:** the old selector's words must overlap the element's name or its own test id. This is the only check that judges meaning by string, so when `HEALER_CONFIRM` is on, a mismatch here is passed to the second opinion instead of being final.
+8. **Second opinion** — see `HEALER_CONFIRM` below.
 
 **When to use:**
 - Keep `enforce` in production suites — it prevents the healer from "fixing" a failing `#submit-btn` by returning the first button it finds regardless of purpose.
@@ -171,6 +194,37 @@ The four checks run in order: action compatibility (e.g. `fill()` cannot target 
 
 ```env
 HEALER_INTENT_CHECK=warn
+```
+
+### `HEALER_CONFIRM` (default: `true`)
+
+Before a heal is accepted, the provider is asked one narrow question, with no candidate list and no instruction to find anything: *is this element the same control the test meant, renamed or moved, or a different one?* The heal is accepted only on a clear "same". An error, a timeout or an unreadable reply all count as "no".
+
+It exists because the model that picks an element is asked to *find* one, and leans towards finding one. On held-out audit sets it healed Edit profile → Edit password, Transfer $100 → Transfer $1,000 and Close dialog → Close account; each of those passed every deterministic check above.
+
+The question is redacted exactly like the heal itself. It is skipped when the element only moved and kept its text. It is asked at most 3 times per heal. Measured with `claude-haiku-4-5` picking and `claude-sonnet-5` confirming, a successful heal averages about 2,350 tokens and 7.4 s. When the question is skipped, it is about 1,550 tokens and 4.6 s. Under `HEALER_REDACT=strict`, names of non-actionable elements and test ids are withheld, so the second opinion has less to go on and refuses more often.
+
+**When to use:** keep it on. Turn it off only to save a call per heal on a suite where you accept a higher risk of a heal landing on a lookalike. Custom providers that implement only `heal()` skip it automatically.
+
+```env
+HEALER_CONFIRM=true
+```
+
+### `HEALER_CONFIRM_MODEL` (default: `claude-sonnet-5` on Anthropic, otherwise the healing model)
+
+The model asked the second-opinion question. Picking an element is a high-volume, low-stakes step, so a cheap model does it well. The accept-or-reject decision is a single short question with high stakes, so it gets a stronger model.
+
+Measured on 28 audit questions, each a real rename or a lookalike trap shown with the controls beside it:
+
+| Model | Right | Accepted a trap | Refused a real rename | Per question |
+|---|---|---|---|---|
+| `claude-haiku-4-5` | 20/28 | 0 | 8 (incl. Charter Cloud → Private Cloud) | ~700 tokens, 3.1 s |
+| `claude-sonnet-5` | 28/28 | 0 | 0 | ~900 tokens, 3.1 s |
+
+On OpenAI and Gemini nothing equivalent was measured, so the default is the healing model rather than a model you may not have access to. Set a stronger one explicitly.
+
+```env
+HEALER_CONFIRM_MODEL=claude-sonnet-5
 ```
 
 ### `HEALER_UNVERIFIED_CONFIDENCE` (default: `0.9`)
@@ -406,10 +460,13 @@ HEALING_LOGS=true
 ```
 
 **Air-gapped / on-prem**
+
+`HEALER_PROVIDER=ollama` is not implemented. An on-prem server that speaks the OpenAI Chat Completions protocol — Ollama's `/v1` endpoint, vLLM, a gateway — can be reached through the `openai` provider instead. This package's own suite does not test that path, and small local models heal noticeably worse, so run the corpus against it before relying on it.
 ```env
-HEALER_PROVIDER=ollama
-OLLAMA_URL=http://ml-server.internal:11434
-OLLAMA_MODEL=llama3.1
+HEALER_PROVIDER=openai
+OPENAI_BASE_URL=http://ml-server.internal:11434/v1
+OPENAI_MODEL=llama3.1
+OPENAI_API_KEY=unused-by-ollama   # required by the config; Ollama ignores it
 HEALER_TIMEOUT=60000
 HEALER_ALLOWED_ORIGINS=http://localhost:4000
 ```

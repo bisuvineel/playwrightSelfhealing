@@ -84,6 +84,8 @@ export class HealBudget {
   private refusedByBreaker = 0;
   private consecutiveFailures = 0;
   private breakerOpen = false;
+  /** Set by {@link disable}; once set, every heal in this worker is refused. */
+  private disabledReason: string | null = null;
 
   /**
    * @param policy - Ceiling and breaker threshold. Defaults leave both off, so an engine
@@ -103,6 +105,15 @@ export class HealBudget {
    * @returns `null` when the heal may proceed, or why it may not.
    */
   check(): BudgetRefusal | null {
+    // A configuration failure outranks everything: nothing below can change the answer.
+    if (this.disabledReason !== null) {
+      this.refusedByBreaker += 1;
+      return {
+        kind: 'breaker',
+        reason: `healing is off for the rest of this worker — ${this.disabledReason}`,
+      };
+    }
+
     if (this.breakerOpen) {
       this.refusedByBreaker += 1;
       return {
@@ -172,6 +183,38 @@ export class HealBudget {
           'action. Set HEALER_BREAKER_THRESHOLD=0 to disable this.'
       );
     }
+  }
+
+  /**
+   * Switches healing off for the rest of this worker, immediately, with a reason.
+   *
+   * For failures that no retry can fix — an untrusted certificate, a rejected key, a model
+   * that does not exist. The breaker above is the wrong tool for those: it counts failures
+   * *per worker*, so across four workers each seeing a couple of doomed calls it never
+   * trips, and every stale selector in every test pays for a call that cannot succeed.
+   * Measured on a run behind HTTPS inspection: two failed calls per selector, per test,
+   * with the breaker never opening.
+   *
+   * Applied even when `HEALER_BREAKER_THRESHOLD=0`. That setting exists to tolerate a
+   * provider that is flaky; a configuration failure is not flakiness, and continuing only
+   * spends time on calls with a known outcome. The first failure keeps its full message,
+   * so the reason every later heal is skipped names the fix.
+   *
+   * @param reason - Why healing cannot work, including how to fix it.
+   */
+  disable(reason: string): void {
+    if (this.disabledReason !== null) return;
+
+    this.disabledReason = reason;
+    this.log.error(
+      `Healing is off for the rest of this worker: ${reason}. Every further heal is ` +
+        'skipped rather than retried, since the result would be the same.'
+    );
+  }
+
+  /** Why healing was switched off by {@link disable}, or `null` if it was not. */
+  get disabled(): string | null {
+    return this.disabledReason;
   }
 
   /** Records a provider call that worked, clearing the consecutive-failure count. */

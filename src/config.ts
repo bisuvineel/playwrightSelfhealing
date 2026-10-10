@@ -77,6 +77,11 @@ export interface HealingConfig {
   /** Per-healing-request timeout in milliseconds. */
   timeout: number;
   /**
+   * Hard ceiling on the snapshot embedded in a prompt, in characters. `0` is unlimited.
+   * See {@link HealConfig.maxSnapshotChars} for why there is one.
+   */
+  maxSnapshotChars: number;
+  /**
    * Heals that may reach the provider, per **worker**. 0 means no ceiling.
    *
    * Playwright workers are separate processes, so the effective ceiling for a run is this
@@ -100,6 +105,15 @@ export interface HealingConfig {
    * page is rejected and a normal heal follows.
    */
   cache: boolean;
+  /**
+   * Offer the model a numbered list of addressable elements to pick from, instead of
+   * asking it to write a locator. See {@link HealConfig.candidates}.
+   */
+  candidates: boolean;
+  /** Second-opinion check before accepting a heal. See {@link HealConfig.confirm}. */
+  confirm: boolean;
+  /** Model for the second opinion; `undefined` uses the healing model. */
+  confirmModel?: string;
   /**
    * When true, a test that needed healing **fails** even though healing worked.
    *
@@ -175,6 +189,13 @@ const DEFAULTS = {
   // the provider was not asked. Turn it off with HEALER_CACHE=false when investigating
   // healing behaviour and you want every heal to go to the model.
   cache: true,
+  // On: it is what stops a correct diagnosis becoming a broken locator. Off restores
+  // free-form authoring, which exists so a team that hits a problem with picking can
+  // fall back without downgrading the package.
+  candidates: true,
+  // On: the picking model leans towards finding *a* successor, and a narrow second
+  // question is what stops it healing onto lookalikes. Off saves one small call per heal.
+  confirm: true,
   // A ceiling generous enough never to bother an ordinary suite, and low enough that a
   // badly rotted one cannot quietly spend an hour of wall clock. Per worker, so the run
   // total is this times `workers` — documented rather than hidden.
@@ -191,6 +212,11 @@ const DEFAULTS = {
   threshold: 0.7,
   maxRetries: 2,
   timeout: 30_000,
+  // Generous for any ordinary page — a dense application screen serialises to well
+  // under 10,000 characters, and a 50-row table to about 8,000 — while bounding the
+  // data grids that would otherwise send 80,000+ tokens per attempt. Candidates are
+  // enumerated before the cut, so the target stays pickable either way.
+  maxSnapshotChars: 40_000,
   browser: 'chromium' as BrowserType,
   headless: true,
   showBrowser: false,
@@ -225,11 +251,39 @@ const REDACT_LEVELS: readonly RedactLevel[] = ['off', 'identifiers', 'strict'];
 const INTENT_MODES: readonly IntentMode[] = ['off', 'warn', 'enforce'];
 
 /** Default model per provider, used when `<PROVIDER>_MODEL` is unset. */
+/**
+ * Model for the second-opinion check, per provider, when `HEALER_CONFIRM_MODEL` is unset.
+ *
+ * That one question decides whether a heal is accepted, so it gets a stronger model than
+ * picking does. Measured on 28 audit questions — real renames and lookalike traps, each
+ * with the controls beside it: `claude-haiku-4-5` refused 8 real renames, among them
+ * Charter Cloud → Private Cloud; `claude-sonnet-5` answered all 28 correctly. Neither
+ * accepted a trap. Same latency (~3 s); ~900 tokens a question.
+ *
+ * Only Anthropic gets a different default. For the others no equivalent was measured,
+ * and naming a model a user may not have access to would break every heal; their second
+ * opinion uses the healing model unless `HEALER_CONFIRM_MODEL` says otherwise.
+ */
+const DEFAULT_CONFIRM_MODELS: Partial<Record<ProviderType, string>> = {
+  anthropic: 'claude-sonnet-5',
+};
+
 const DEFAULT_MODELS: Record<ProviderType, string> = {
   // Haiku is the default because healing is a high-volume, narrowly scoped task: read a
   // page snapshot, name one element. A cheaper model keeps the cost per failed action in
   // the fractions-of-a-cent range, which matters when a suite heals dozens of times.
-  anthropic: 'claude-haiku-4-5',
+  //
+  // Pinned to the dated snapshot rather than the `claude-haiku-4-5` alias: an alias can
+  // move to a newer snapshot, and a test tool whose heal decisions change on an unchanged
+  // commit is not reproducible. Haiku 4.5 is the one current Anthropic model with a
+  // distinct dated ID — Opus/Sonnet 4.6 and later have a single ID and nothing to pin. A
+  // pinned snapshot eventually retires; when it does, the first heal fails fast with
+  // "model not found" and healing switches off for the run, rather than failing slowly.
+  anthropic: 'claude-haiku-4-5-20251001',
+  // Not pinned: which snapshot the `gpt-4o` alias resolves to is the provider's to say,
+  // and guessing one could pin an older model than the alias serves today. The served
+  // snapshot is recorded on every heal and the first difference is reported, with the
+  // exact name to pin.
   openai: 'gpt-4o',
   gemini: 'gemini-2.0-flash',
   ollama: 'llama3.1',
@@ -551,8 +605,20 @@ export function getConfig(context: ConfigContext = {}): Config {
       threshold: parseNumber('HEALER_THRESHOLD', DEFAULTS.threshold, 0, 1),
       maxRetries: parseNumber('HEALER_MAX_RETRIES', DEFAULTS.maxRetries, 0, 10, true),
       timeout: parseNumber('HEALER_TIMEOUT', DEFAULTS.timeout, 1_000, 600_000, true),
+      maxSnapshotChars: parseNumber(
+        'HEALER_MAX_SNAPSHOT_CHARS',
+        DEFAULTS.maxSnapshotChars,
+        0,
+        5_000_000,
+        true
+      ),
       failOnHeal: parseBoolean('HEALER_FAIL_ON_HEAL', DEFAULTS.failOnHeal),
       cache: parseBoolean('HEALER_CACHE', DEFAULTS.cache),
+      candidates: parseBoolean('HEALER_CANDIDATES', DEFAULTS.candidates),
+      confirm: parseBoolean('HEALER_CONFIRM', DEFAULTS.confirm),
+      ...((readEnv('HEALER_CONFIRM_MODEL') ?? DEFAULT_CONFIRM_MODELS[provider]) !== undefined
+        ? { confirmModel: (readEnv('HEALER_CONFIRM_MODEL') ?? DEFAULT_CONFIRM_MODELS[provider]) as string }
+        : {}),
       maxHeals: parseNumber('HEALER_MAX_HEALS', DEFAULTS.maxHeals, 0, 100_000, true),
       breakerThreshold: parseNumber(
         'HEALER_BREAKER_THRESHOLD',
@@ -663,6 +729,9 @@ export function validateConfig(): void {
   console.log(
     `[config] Configuration valid — provider=${provider}, model=${model}, ` +
       `threshold=${config.healing.threshold}, maxRetries=${config.healing.maxRetries}, ` +
+      `maxSnapshotChars=${config.healing.maxSnapshotChars === 0 ? 'unlimited' : config.healing.maxSnapshotChars}, ` +
+      `candidates=${config.healing.candidates ? 'on' : 'off'}, ` +
+      `confirm=${config.healing.confirm ? `on (${config.healing.confirmModel ?? model})` : 'off'}, ` +
       `browser=${config.playwright.browser} (${config.playwright.headless ? 'headless' : 'headed'}).`
   );
 

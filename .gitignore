@@ -19,5 +19,3 @@ test-results.json
 # HEALER_PRIVACY_PREVIEW output. Holds the page content a heal would have sent —
 # redacted, but redaction is what you are inspecting, so never commit it.
 privacy-preview/
-
-settings.json

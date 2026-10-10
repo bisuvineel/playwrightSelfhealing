@@ -33,18 +33,20 @@
  * different element, the intent check's action-compatibility gate rejects the hit and the
  * heal proceeds normally.
  *
- * ## Deliberately not persisted
+ * ## Shared within a run, never across runs
  *
- * This is in-memory and per-worker. Two tempting extensions are left out on purpose:
+ * Inside a Playwright run, heals are also shared between workers through a
+ * {@link SharedSelectorStore}, with single-flight claims so concurrent workers wait for
+ * one answer instead of each buying it. Measured on the demo with four workers: 12
+ * provider calls for 7 distinct stale selectors with a per-worker cache, 7 with sharing
+ * and claims. Sharing alone got to 11 — the duplicates were concurrent, not sequential.
+ * The store is deleted when the run ends.
  *
- * - **A committed `selector-map.json`** would turn a recurring cost into a one-off, and
- *   also into a maintenance trap: the page objects rot indefinitely while a JSON file
- *   papers over them. That fights the rest of this package, whose reporter and
- *   `HEALER_FAIL_ON_HEAL` gate both exist to push the fix into the source. Making rot
- *   free removes the incentive to fix it.
- * - **Cross-worker sharing** would need a lock file and a run-scoped lifecycle to avoid
- *   becoming the stale map above, and would save only the first heal per worker rather
- *   than per test — a small gain for real complexity.
+ * What stays out on purpose is **a committed `selector-map.json`**. It would turn a
+ * recurring cost into a one-off, and also into a maintenance trap: the page objects rot
+ * indefinitely while a JSON file papers over them. That fights the rest of this package,
+ * whose reporter and `HEALER_FAIL_ON_HEAL` gate both exist to push the fix into the
+ * source. Making rot free removes the incentive to fix it.
  *
  * A cache hit still counts as a heal everywhere it matters: the annotation, the records
  * file, the reporter's rewrite list, and the CI gate. The cache makes the rot cheaper to
@@ -54,6 +56,7 @@
  */
 
 import { createLogger, type Logger } from '../utils/logger';
+import type { SharedSelectorStore } from './SharedSelectorStore';
 
 /**
  * How many replacements to remember per original selector.
@@ -101,6 +104,13 @@ export interface SelectorCacheStats {
   /** Distinct original selectors remembered. */
   tracked: number;
   /**
+   * Of {@link hits}, how many reused a selector another worker in this run had healed.
+   *
+   * The number that shows the shared store paying for itself: each one is a provider
+   * call a per-worker cache would have made.
+   */
+  sharedHits: number;
+  /**
    * Selectors dropped because the cache was full.
    *
    * Reported rather than left silent: a bounded cache that never says it evicted looks
@@ -115,7 +125,10 @@ export interface SelectorCacheStats {
 export class SelectorCache {
   private readonly entries = new Map<string, CachedSelector[]>();
   private readonly log: Logger;
+  /** `original\u0000replacement` pairs that came from another worker, for the stats. */
+  private readonly fromShared = new Set<string>();
   private hits = 0;
+  private sharedHits = 0;
   private misses = 0;
   private probes = 0;
   private evicted = 0;
@@ -123,14 +136,33 @@ export class SelectorCache {
   /**
    * @param enabled - When false, every method is inert and `candidates()` returns
    * nothing, so the engine behaves exactly as it did before this cache existed.
+   * @param shared - Where the other workers of this run publish their heals, or `null`
+   * for a cache private to this worker. See {@link SharedSelectorStore}.
    */
-  constructor(private readonly enabled: boolean = true) {
+  constructor(
+    private readonly enabled: boolean = true,
+    private readonly shared: SharedSelectorStore | null = null
+  ) {
     this.log = createLogger('heal:cache');
   }
 
   /** Whether the cache is switched on. */
   get isEnabled(): boolean {
     return this.enabled;
+  }
+
+  /**
+   * Whether this worker has healed `originalSelector` itself, or reused a heal for it.
+   *
+   * Asked before every action, so it reads only this worker's memory: no shared-store
+   * file read, and no reordering of the eviction list. A heal another worker made is
+   * found by the normal path the first time, and known here from then on.
+   *
+   * @param originalSelector - The expression about to be acted on.
+   * @returns True when {@link candidates} has at least one local entry.
+   */
+  knows(originalSelector: string): boolean {
+    return this.enabled && (this.entries.get(originalSelector)?.length ?? 0) > 0;
   }
 
   /**
@@ -143,14 +175,23 @@ export class SelectorCache {
     if (!this.enabled) return [];
 
     const found = this.entries.get(originalSelector);
-    if (found === undefined) return [];
 
-    // Re-inserting moves the key to the end of the Map's iteration order, which is what
-    // makes the eviction in `remember` least-recently-*used* rather than oldest-first.
-    this.entries.delete(originalSelector);
-    this.entries.set(originalSelector, found);
+    // What this worker learned comes first; what another worker in the run learned
+    // follows, so a selector whose meaning differs by page keeps this worker's answer.
+    const local = found ?? [];
+    const others = (this.shared?.read(originalSelector) ?? []).filter(
+      (candidate) => !local.some((mine) => mine.selector === candidate.selector)
+    );
+    for (const candidate of others) this.fromShared.add(`${originalSelector}\u0000${candidate.selector}`);
 
-    return found;
+    if (found !== undefined) {
+      // Re-inserting moves the key to the end of the Map's iteration order, which is what
+      // makes the eviction in `remember` least-recently-*used* rather than oldest-first.
+      this.entries.delete(originalSelector);
+      this.entries.set(originalSelector, found);
+    }
+
+    return [...local, ...others].slice(0, MAX_CANDIDATES);
   }
 
   /**
@@ -173,6 +214,10 @@ export class SelectorCache {
     this.entries.delete(originalSelector);
     this.entries.set(originalSelector, [entry, ...withoutDuplicate].slice(0, MAX_CANDIDATES));
 
+    // Published for the rest of the run. Every entry is re-validated and re-intent-checked
+    // by whichever worker reuses it, so sharing cannot make a heal less safe.
+    this.shared?.write(originalSelector, entry);
+
     // Maps iterate in insertion order, so the first key is the least recently used.
     while (this.entries.size > MAX_TRACKED) {
       const oldest = this.entries.keys().next();
@@ -189,11 +234,13 @@ export class SelectorCache {
    * @param originalSelector - The selector that failed.
    * @param selector - The cached replacement that worked.
    */
-  noteHit(originalSelector: string, selector: string): void {
+  noteHit(originalSelector: string, selector: string, rawSelector: string = selector): void {
     this.hits += 1;
+    const fromOther = this.fromShared.has(`${originalSelector}\u0000${rawSelector}`);
+    if (fromOther) this.sharedHits += 1;
     this.log.info(
-      `Reused "${selector}" for "${originalSelector}" from this worker's cache — ` +
-        'no provider call.'
+      `Reused "${selector}" for "${originalSelector}" from ` +
+        `${fromOther ? 'another worker in this run' : "this worker's cache"} — no provider call.`
     );
   }
 
@@ -207,6 +254,47 @@ export class SelectorCache {
     this.log.debug(`Nothing cached for "${originalSelector}".`);
   }
 
+  /**
+   * Takes back a miss that turned into a hit, after waiting for another worker's answer.
+   * Without this a waited-for reuse would count as both, and understate what was saved.
+   */
+  retractMiss(): void {
+    if (this.misses > 0) this.misses -= 1;
+  }
+
+  /**
+   * Claims a selector for this worker to heal, so the other workers of the run wait for
+   * the answer instead of buying the same one. See {@link SharedSelectorStore.claim}.
+   *
+   * @param originalSelector - The selector about to be healed.
+   * @returns False only when another worker is healing it right now.
+   */
+  claim(originalSelector: string): boolean {
+    if (!this.enabled || this.shared === null) return true;
+    return this.shared.claim(originalSelector);
+  }
+
+  /**
+   * Releases a claim. Safe to call on every exit path, held or not.
+   *
+   * @param originalSelector - The selector whose heal is over.
+   */
+  release(originalSelector: string): void {
+    this.shared?.release(originalSelector);
+  }
+
+  /**
+   * Waits, bounded, for another worker's answer to a selector it has claimed.
+   *
+   * @param originalSelector - The selector being healed elsewhere.
+   * @param timeoutMs - How long to wait at most.
+   * @returns True when an answer was published and is now among the candidates.
+   */
+  async awaitPeer(originalSelector: string, timeoutMs: number): Promise<boolean> {
+    if (!this.enabled || this.shared === null) return false;
+    return this.shared.awaitPeer(originalSelector, timeoutMs);
+  }
+
   /** Records one DOM probe of a cached candidate, successful or not. */
   noteProbe(): void {
     this.probes += 1;
@@ -216,6 +304,7 @@ export class SelectorCache {
   stats(): SelectorCacheStats {
     return {
       hits: this.hits,
+      sharedHits: this.sharedHits,
       misses: this.misses,
       probes: this.probes,
       tracked: this.entries.size,
@@ -231,12 +320,13 @@ export class SelectorCache {
   describe(): string {
     if (!this.enabled) return 'disabled';
 
-    const { hits, misses, tracked, evicted } = this.stats();
+    const { hits, sharedHits, misses, tracked, evicted } = this.stats();
     const total = hits + misses;
     const saved = total > 0 ? Math.round((hits / total) * 100) : 0;
 
     return (
-      `${tracked} selector(s) cached, ${hits} reuse(s), ${misses} miss(es)` +
+      `${tracked} selector(s) cached, ${hits} reuse(s)` +
+      `${sharedHits > 0 ? ` (${sharedHits} from other workers)` : ''}, ${misses} miss(es)` +
       `${evicted > 0 ? `, ${evicted} evicted` : ''}` +
       `${total > 0 ? ` — ${saved}% of heals avoided a call` : ''}`
     );
@@ -245,7 +335,9 @@ export class SelectorCache {
   /** Forgets everything. Used by tests. */
   clear(): void {
     this.entries.clear();
+    this.fromShared.clear();
     this.hits = 0;
+    this.sharedHits = 0;
     this.misses = 0;
     this.probes = 0;
     this.evicted = 0;

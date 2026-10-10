@@ -14,7 +14,7 @@
 
 import { AiProvider, type HealOptions } from '../core/AiProvider';
 import type { HealingRequest, HealingResponse } from '../types';
-import { HttpError, postJson } from './httpJson';
+import { asProviderFailure, HttpError, postJson } from './httpJson';
 
 /** Default API root. Overridden by `GEMINI_BASE_URL` or the `baseUrl` option. */
 const DEFAULT_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
@@ -28,6 +28,16 @@ const THINKING_MODEL_PATTERN = /(?:2\.5|thinking)/i;
 
 /** Output ceiling used for thinking-capable models. */
 const THINKING_MAX_TOKENS = 4_096;
+
+/**
+ * Model families that take a pinned `temperature`, so a heal can be made repeatable.
+ *
+ * An allowlist, as for the other providers. Gemini 1.5, 2.0 and 2.5 accept any value;
+ * later families are left at the provider default, because Google's guidance for them is
+ * to keep the default temperature, and a heal is not worth degrading to make it
+ * repeatable.
+ */
+const SAMPLING_MODEL_PATTERN = /^gemini-(?:1\.5|2\.0|2\.5)/i;
 
 /** Optional tuning. */
 export interface GeminiProviderOptions {
@@ -54,10 +64,15 @@ interface GenerateContentResponse {
   }>;
   promptFeedback?: { blockReason?: string };
   usageMetadata?: {
+    /** All input tokens, cached or not. */
     promptTokenCount?: number;
     candidatesTokenCount?: number;
     thoughtsTokenCount?: number;
+    /** Implicit caching: how many of `promptTokenCount` were served from cache. */
+    cachedContentTokenCount?: number;
   };
+  /** The model version that served the request. */
+  modelVersion?: string;
 }
 
 /**
@@ -125,7 +140,9 @@ export class GeminiProvider extends AiProvider {
         ...(options.signal ? { signal: options.signal } : {}),
       });
     } catch (error) {
-      throw this.describeError(error, 'Healing request failed');
+      // Classified on the original error, before it is rewritten for display. Gemini's
+      // bad-key signal is a 400, which the classifier recognises by its error code.
+      throw asProviderFailure(error, this.describeError(error, 'Healing request failed'));
     }
 
     // A blocked prompt returns 200 with no candidates at all.
@@ -156,9 +173,20 @@ export class GeminiProvider extends AiProvider {
       .trim();
 
     const parsed = this.parseResponse(text);
-    if (!parsed.suggestedSelector) {
+    // Throw only when there is no answer at all. `parseResponse` leaves `confidence`
+    // unset exactly when it found no usable JSON object, which is a malformed reply.
+    //
+    // A parsed answer that names nothing is not malformed — it is a **refusal**, and the
+    // prompt asks for one: "if no element on the page plausibly matches, return confidence
+    // 0". Throwing on it treated the model's most careful answer as an outage. Measured
+    // against the real claude-haiku-4-5 refusal: three honest refusals opened the circuit
+    // breaker, healing stopped for the rest of the run on a healthy provider, ~9,000 tokens
+    // were billed and none recorded, and the model's reasoning — the one thing a human
+    // needed — was discarded. After a redesign several elements genuinely are gone, so it
+    // fired exactly when healing mattered most. The engine now reports a refusal as one.
+    if (parsed.confidence === undefined) {
       throw new Error(
-        `Gemini returned no usable selector (finishReason: ${candidate?.finishReason ?? 'unknown'}).`
+        `Gemini returned no usable answer (finishReason: ${candidate?.finishReason ?? 'unknown'}).`
       );
     }
 
@@ -168,9 +196,13 @@ export class GeminiProvider extends AiProvider {
       (response.usageMetadata?.thoughtsTokenCount ?? 0);
 
     const result: HealingResponse = {
-      suggestedSelector: parsed.suggestedSelector,
+      // Empty when the model answered with an id alone; `HealingEngine.resolveChoices`
+      // fills it in from the candidate that id names.
+      suggestedSelector: parsed.suggestedSelector ?? '',
       confidence: parsed.confidence ?? 0,
       reasoning: parsed.reasoning ?? '',
+      ...(parsed.candidateId !== undefined ? { candidateId: parsed.candidateId } : {}),
+      ...(parsed.alternatives !== undefined ? { alternatives: parsed.alternatives } : {}),
       // Spread-in rather than assigned: `exactOptionalPropertyTypes` rejects an
       // explicit `undefined` on an optional field, and the intent check treats a
       // missing claim differently from an empty one.
@@ -179,8 +211,11 @@ export class GeminiProvider extends AiProvider {
       tokenUsage: {
         input: response.usageMetadata?.promptTokenCount ?? 0,
         output,
+        ...(response.usageMetadata?.cachedContentTokenCount
+          ? { cached: response.usageMetadata.cachedContentTokenCount }
+          : {}),
       },
-      provider: `gemini:${this.model}`,
+      provider: `gemini:${this.servedModel(response.modelVersion)}`,
     };
 
     // The suggestion is logged at debug only — see the note in AnthropicProvider.heal.
@@ -188,9 +223,68 @@ export class GeminiProvider extends AiProvider {
       `Answered for "${request.originalSelector}" with confidence ${result.confidence} — ` +
         `${result.tokenUsage.input} in / ${result.tokenUsage.output} out tokens.`
     );
-    this.logDebug(`Suggested selector: ${result.suggestedSelector}`);
+    this.logDebug(
+      `Suggested: ${result.candidateId !== undefined ? `candidate ${result.candidateId}` : result.suggestedSelector}` +
+        `${result.alternatives?.length ? ` (+${result.alternatives.length} alternative(s))` : ''}`
+    );
 
     return result;
+  }
+
+  /**
+   * One plain exchange, for the second-opinion check. Same transport, deadline, model
+   * and sampling rules as {@link heal}.
+   *
+   * @param system - System prompt.
+   * @param user - User prompt.
+   * @param options - Per-call controls.
+   * @returns The reply text, cost and served model.
+   */
+  protected async complete(
+    system: string,
+    user: string,
+    options: HealOptions = {}
+  ): Promise<{ text: string; tokenUsage: HealingResponse['tokenUsage']; provider: string }> {
+    const model = options.model ?? this.model;
+
+    let response: GenerateContentResponse;
+    try {
+      response = await postJson<GenerateContentResponse>({
+        url: this.endpoint('generateContent', model),
+        headers: { 'x-goog-api-key': this.apiKey },
+        body: {
+          systemInstruction: { parts: [{ text: system }] },
+          contents: [{ role: 'user', parts: [{ text: user }] }],
+          generationConfig: {
+            maxOutputTokens: this.maxTokens,
+            ...(this.jsonMode ? { responseMimeType: 'application/json' } : {}),
+            ...(SAMPLING_MODEL_PATTERN.test(model) ? { temperature: 0 } : {}),
+          },
+        },
+        timeoutMs: this.timeoutMs,
+        maxRetries: this.maxRetries,
+        ...(this.fetchImpl ? { fetchImpl: this.fetchImpl } : {}),
+        label: 'Gemini confirmation request',
+        ...(options.signal ? { signal: options.signal } : {}),
+      });
+    } catch (error) {
+      throw asProviderFailure(error, this.describeError(error, 'Confirmation request failed'));
+    }
+
+    return {
+      // A blocked prompt has no candidates, so the text is empty and reads as "no".
+      text: (response.candidates?.[0]?.content?.parts ?? [])
+        .map((part) => part.text ?? '')
+        .join('')
+        .trim(),
+      tokenUsage: {
+        input: response.usageMetadata?.promptTokenCount ?? 0,
+        output:
+          (response.usageMetadata?.candidatesTokenCount ?? 0) +
+          (response.usageMetadata?.thoughtsTokenCount ?? 0),
+      },
+      provider: `gemini:${this.servedModel(response.modelVersion)}`,
+    };
   }
 
   /**
@@ -244,8 +338,9 @@ export class GeminiProvider extends AiProvider {
    * @param method - API method, e.g. `generateContent`.
    * @returns The absolute URL.
    */
-  private endpoint(method: string): string {
-    const model = this.model.startsWith('models/') ? this.model : `models/${this.model}`;
+  private endpoint(method: string, override?: string): string {
+    const name = override ?? this.model;
+    const model = name.startsWith('models/') ? name : `models/${name}`;
     return `${this.baseUrl}/${model}:${method}`;
   }
 
@@ -257,11 +352,13 @@ export class GeminiProvider extends AiProvider {
    */
   private buildBody(request: HealingRequest): Record<string, unknown> {
     return {
-      systemInstruction: { parts: [{ text: this.buildSystemPrompt() }] },
+      systemInstruction: { parts: [{ text: this.buildSystemPrompt(request) }] },
       contents: [{ role: 'user', parts: [{ text: this.buildUserPrompt(request) }] }],
       generationConfig: {
         maxOutputTokens: this.maxTokens,
         ...(this.jsonMode ? { responseMimeType: 'application/json' } : {}),
+        // Repeatable heals where the model family allows it. See SAMPLING_MODEL_PATTERN.
+        ...(SAMPLING_MODEL_PATTERN.test(this.model) ? { temperature: 0 } : {}),
       },
     };
   }

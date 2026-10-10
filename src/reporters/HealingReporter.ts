@@ -27,6 +27,7 @@ import type { Reporter, TestCase, TestResult } from '@playwright/test/reporter';
 import { getConfig } from '../config';
 import { PrivacyGuard } from '../core/PrivacyGuard';
 import { HEAL_ANNOTATIONS } from '../core/TestWrapper';
+import { SharedSelectorStore } from '../core/SharedSelectorStore';
 
 /** One healed selector, as reported by a test. */
 interface HealEntry {
@@ -46,7 +47,7 @@ interface HealingData {
   outcome?: string;
   cached?: boolean;
   described?: boolean | null;
-  tokens?: { input?: number; output?: number };
+  tokens?: { input?: number; output?: number; cached?: number };
 }
 
 /** Options accepted from the reporter tuple in `playwright.config.ts`. */
@@ -87,7 +88,7 @@ export default class HealingReporter implements Reporter {
   private blocked = new Map<string, number>();
   private skipped = new Map<string, number>();
   private unavailable = new Map<string, number>();
-  private tokens = { input: 0, output: 0 };
+  private tokens = { input: 0, output: 0, cached: 0 };
   /** `#old → new` pairs, deduplicated across the run. */
   private rewrites = new Map<string, string>();
   /** Heals that reused a cached selector, so cost nothing. */
@@ -101,7 +102,26 @@ export default class HealingReporter implements Reporter {
   /** Healing attachments parsed, so a missing one can be reported rather than hidden. */
   private attachmentsSeen = 0;
 
-  constructor(private options: HealingReporterOptions = {}) {}
+  /** This run's id, owned by this reporter only if it was the one to create it. */
+  private readonly ownedRunId: string | null;
+
+  /**
+   * @param options - Output options.
+   */
+  constructor(private options: HealingReporterOptions = {}) {
+    // Give the run an identity before any worker starts. This constructor runs in the
+    // Playwright runner process, and workers are forked with the runner's environment —
+    // confirmed in Playwright's own process host (`env: { ...process.env }`) — so every
+    // worker of this run sees the same id and no other run does. That is what makes the
+    // cross-worker selector cache exactly run-scoped. A value already set (by CI, say)
+    // is respected, and then this reporter does not delete what it did not create.
+    if (process.env.HEALER_RUN_ID === undefined) {
+      this.ownedRunId = SharedSelectorStore.newRunId();
+      process.env.HEALER_RUN_ID = this.ownedRunId;
+    } else {
+      this.ownedRunId = null;
+    }
+  }
 
   /**
    * Reporter API: collect what this test produced.
@@ -133,6 +153,7 @@ export default class HealingReporter implements Reporter {
     for (const data of this.readHealingData(result)) {
       this.tokens.input += data.tokens?.input ?? 0;
       this.tokens.output += data.tokens?.output ?? 0;
+      this.tokens.cached += data.tokens?.cached ?? 0;
       this.attachmentsSeen += 1;
 
       if (data.cached) this.reused += 1;
@@ -224,6 +245,10 @@ export default class HealingReporter implements Reporter {
 
   /** Reporter API: print the summary. */
   onEnd(): void {
+    // The run is over, so what its workers shared goes with it. Never carried into the
+    // next run — that would make rot cheap, which this package exists to prevent.
+    if (this.ownedRunId !== null) SharedSelectorStore.removeRun(this.ownedRunId);
+
     const nothingHappened =
       this.healed.length === 0 &&
       this.failed.length === 0 &&
@@ -284,7 +309,10 @@ export default class HealingReporter implements Reporter {
       `  healed: ${this.healed.length}    failed: ${this.failed.length}    ` +
         `blocked: ${blockedCount}` +
         `${skippedCount > 0 ? `    skipped: ${skippedCount}` : ''}${reuse}    ` +
-        `tokens: ${this.tokens.input} in / ${this.tokens.output} out`
+        `tokens: ${this.tokens.input} in / ${this.tokens.output} out` +
+        // Shown only when it happened: a cache that silently never engages looks exactly
+        // like a working one in every other number.
+        `${this.tokens.cached > 0 ? ` (${this.tokens.cached} of the input served from cache)` : ''}`
     );
 
     if (this.retried > 0) {

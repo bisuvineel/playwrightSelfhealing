@@ -7,10 +7,6 @@
 
 import { defineConfig, devices } from '@playwright/test';
 
-import 'dotenv/config';
-
-
-
 const BASE_URL = process.env.BASE_URL ?? 'http://127.0.0.1:4173';
 
 /**
@@ -63,9 +59,8 @@ export default defineConfig({
 
   expect: { timeout: 5_000 },
 
-  fullyParallel: false,
+  fullyParallel: true,
   forbidOnly: !!process.env.CI,
-  workers: 1,
   retries: 0,
   // Spread in rather than set to `undefined`: omitting the key lets Playwright pick its
   // own default, which is what "undefined" was trying to say. The same idiom the rest of
@@ -85,11 +80,11 @@ export default defineConfig({
     trace: 'on',
     screenshot: 'only-on-failure',
     // Honours HEADLESS / SHOW_BROWSER — see the note at the top of this file.
-    headless: false,
+    headless: HEADLESS,
     // Short, so a stale selector fails fast and healing starts sooner.
     actionTimeout: 5_000,
-    navigationTimeout: 60_000,
-
+    navigationTimeout: 10_000,
+    ignoreHTTPSErrors: true,
   },
 
   // Honours BROWSER. One project, so a run targets the browser you asked for rather

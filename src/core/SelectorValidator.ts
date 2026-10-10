@@ -95,6 +95,40 @@ interface Refinement {
   index?: number;
 }
 
+/** One builder call in an expression, with any positional refinements applied to it. */
+interface ChainSegment {
+  /** The builder method this segment calls. */
+  call: GetByMethod | 'locator';
+  /** Source text between the call's outer parentheses. */
+  args: string;
+  /** `.first()`, `.last()`, `.nth(n)` applied to this segment, in source order. */
+  refinements: Refinement[];
+}
+
+/**
+ * An expression split into the chain of builder calls it is made of.
+ *
+ * `getByRole('navigation', { name: 'Account' }).getByRole('link', { name: 'Settings' })`
+ * is two segments, resolved by building the first against the page and the second
+ * against the result. `Locator` exposes the same builder surface as `Page`, so this is
+ * the same walk {@link SelectorValidator.resolve} already does for frames.
+ *
+ * Scoping is how a repeated accessible name is addressed at all — two links named
+ * "Settings" under different landmarks have no other unique expression — so refusing
+ * chains meant refusing the whole class. What must stay refused is a chain this
+ * validator would resolve *differently* from Playwright, which is why `.filter()`,
+ * `.and()`, `.or()` and a chained `.locator()` are still reported as unsupported
+ * rather than silently dropped.
+ */
+interface CallChain {
+  /** The calls, outermost first. Empty when the expression is bare CSS or XPath. */
+  segments: ChainSegment[];
+  /** Trailing text that could not be interpreted, or `null` when there is none. */
+  unsupported: string | null;
+  /** True when parentheses did not balance, which is a parse failure rather than a suffix. */
+  unbalanced: boolean;
+}
+
 /**
  * Time allowed for a suggested element to appear.
  *
@@ -116,6 +150,29 @@ function quoteLiteral(value: string): string {
 
 /** Prefixes that mark a selector as belonging to a non-CSS Playwright engine. */
 const NON_CSS_PREFIXES = ['//', '..', 'xpath=', 'text=', 'id=', 'data-testid=', 'css='];
+
+/**
+ * Roles whose accessible name is computed from their own content (ARIA 1.2,
+ * "name from: contents").
+ *
+ * Every other role is named only by an explicit `aria-label`, `aria-labelledby` or
+ * `title`. That distinction is invisible in a snapshot and models get it wrong in one
+ * specific way: they read `- listitem: - link "Private Cloud"`, see a list of menu
+ * items, and answer `getByRole('listitem', { name: 'Private Cloud' })`. The `li` has no
+ * accessible name, so the name filter excludes it and the expression matches nothing —
+ * while `getByRole('link', { name: 'Private Cloud' })` was one word away.
+ *
+ * "Matched no elements" is a true but useless thing to tell a model that had the right
+ * element: it reads as *the element is not there* and sends the next attempt looking
+ * somewhere else. So a zero match on this shape is reported with the reason it was zero.
+ * The list is only used to explain a miss, never to pre-reject — an `aria-label` on the
+ * container makes the same expression correct, and that case still validates normally.
+ */
+const NAME_FROM_CONTENT_ROLES: ReadonlySet<string> = new Set([
+  'button', 'cell', 'checkbox', 'columnheader', 'gridcell', 'heading', 'link',
+  'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'radio', 'row',
+  'rowheader', 'switch', 'tab', 'tooltip', 'treeitem',
+]);
 
 /**
  * Validates AI-suggested selectors against a live page.
@@ -240,7 +297,12 @@ export class SelectorValidator {
 
     if (matches === 0) {
       this.log.debug(`"${selector}" matched no elements.`);
-      return { valid: false, matches, reason: 'matched no elements' };
+      const hint = this.nameOnUnnamedRole(selector);
+      return {
+        valid: false,
+        matches,
+        reason: hint ? `matched no elements — ${hint}` : 'matched no elements',
+      };
     }
 
     if (matches > 1) {
@@ -386,52 +448,67 @@ export class SelectorValidator {
     }
     expression = chain.remainder;
 
-    const stripped = this.stripRefinements(expression);
-    expression = stripped.remainder;
+    const walked = this.splitCallChain(expression);
 
-    const method = GET_BY_METHODS.find((candidate) => expression.startsWith(`${candidate}(`));
+    if (walked.unbalanced) {
+      this.log.debug(`Unbalanced parentheses in "${expression}".`);
+      return null;
+    }
 
-    // Refuse rather than resolve the leading call and drop the rest. Silently ignoring a
+    // Refuse rather than resolve the leading calls and drop the rest. Silently ignoring a
     // trailing `.filter(...)` or `.locator('..')` yields a locator for a *different*
     // element than the expression describes, which is the one failure this class exists
     // to prevent.
-    const call = method ?? (expression.startsWith('locator(') ? 'locator' : null);
-    if (call) {
-      const trailing = this.trailingAfterCall(expression, call);
-      if (trailing !== null) {
-        this.log.debug(
-          `Cannot resolve "${expression}": the trailing "${trailing}" is not something a ` +
-            'text expression can express. Only .first(), .last() and .nth(n) may follow a call.'
-        );
-        return null;
-      }
+    if (walked.unsupported !== null) {
+      this.log.debug(
+        `Cannot resolve "${expression}": the trailing "${walked.unsupported}" is not ` +
+          'something a text expression can express.'
+      );
+      return null;
     }
 
-    let locator: Locator;
-    if (method) {
-      const built = this.buildGetByLocator(method, expression, root);
-      if (!built) return null;
-      locator = built;
-    } else if (expression.startsWith('locator(')) {
-      // The explicit call form. Frame-scoped expressions always use it, because a bare
-      // CSS string after a `frameLocator(...)` prefix would be ambiguous — and models
-      // write `locator('#x')` for page-level selectors regardless.
-      const inner = this.extractCallArguments(expression, 'locator');
-      const argument = inner === null ? undefined : this.splitTopLevel(inner)[0];
-      const value = argument === undefined ? null : this.parseStringLiteral(argument);
-      if (value === null) {
-        this.log.debug(`Could not read the argument of "${expression}".`);
-        return null;
+    // No builder call at all: bare CSS, XPath, or one of Playwright's text= engines,
+    // which `locator()` is the authority on. A positional refinement can still be
+    // attached — `TestWrapper` writes `.row.nth(1)` whenever a CSS locator is refined —
+    // so it is peeled off before the rest is handed over as a selector string.
+    if (walked.segments.length === 0) {
+      const bare = this.stripTrailingRefinements(expression);
+      let locator = root.locator(bare.remainder);
+      for (const refinement of bare.refinements) {
+        locator = this.applyRefinement(locator, refinement);
       }
-      locator = root.locator(value);
-    } else {
-      // locator() understands CSS, XPath, and Playwright's text= engines.
-      locator = root.locator(expression);
+      return locator;
     }
 
-    // Applied outermost-last, so `.nth(2).first()` means what it says.
-    for (const refinement of stripped.refinements) {
-      locator = this.applyRefinement(locator, refinement);
+    let locator: Locator | null = null;
+
+    for (const segment of walked.segments) {
+      // `Locator` exposes the same builder surface as `Page`, so each segment scopes the
+      // next by the same walk used for frames above.
+      const scope: LocatorRoot = locator === null ? root : (locator as unknown as LocatorRoot);
+
+      if (segment.call === 'locator') {
+        // The explicit call form. Frame-scoped expressions always use it, because a bare
+        // CSS string after a `frameLocator(...)` prefix would be ambiguous — and models
+        // write `locator('#x')` for page-level selectors regardless.
+        const argument = this.splitTopLevel(segment.args)[0];
+        const value = argument === undefined ? null : this.parseStringLiteral(argument);
+        if (value === null) {
+          this.log.debug(`Could not read the argument of "locator(${segment.args})".`);
+          return null;
+        }
+        locator = scope.locator(value);
+      } else {
+        const built = this.buildGetByLocator(segment.call, `${segment.call}(${segment.args})`, scope);
+        if (!built) return null;
+        locator = built;
+      }
+
+      // Applied in source order, so `.nth(2).first()` means what it says — and so a
+      // refinement scopes the segment it followed rather than the whole chain.
+      for (const refinement of segment.refinements) {
+        locator = this.applyRefinement(locator, refinement);
+      }
     }
 
     return locator;
@@ -462,13 +539,8 @@ export class SelectorValidator {
   unsupportedSuffix(selector: string): string | null {
     let expression = selector.trim().replace(/^await\s+/, '').replace(/^(?:this\.)?page\./, '');
     expression = this.splitFrameChain(expression).remainder;
-    expression = this.stripRefinements(expression).remainder;
 
-    const method = GET_BY_METHODS.find((candidate) => expression.startsWith(`${candidate}(`));
-    const call = method ?? (expression.startsWith('locator(') ? 'locator' : null);
-    if (!call) return null;
-
-    return this.trailingAfterCall(expression, call);
+    return this.splitCallChain(expression).unsupported;
   }
 
   /**
@@ -492,57 +564,109 @@ export class SelectorValidator {
   unhonouredOptions(selector: string): string[] {
     let expression = selector.trim().replace(/^await\s+/, '').replace(/^(?:this\.)?page\./, '');
     expression = this.splitFrameChain(expression).remainder;
-    expression = this.stripRefinements(expression).remainder;
 
-    const method = GET_BY_METHODS.find((candidate) => expression.startsWith(`${candidate}(`));
-    const call = method ?? (expression.startsWith('locator(') ? 'locator' : null);
-    if (!call) return [];
+    // Every segment, not just the first: an option dropped from a scoping call resolves
+    // a broader scope, which is the same failure one level out.
+    const offenders = new Set<string>();
 
-    const inner = this.extractCallArguments(expression, call);
-    if (inner === null) return [];
+    for (const segment of this.splitCallChain(expression).segments) {
+      const args = this.splitTopLevel(segment.args);
 
-    const args = this.splitTopLevel(inner);
+      // `locator('x', { hasText: … })` — the whole options object is ignored, so name it
+      // rather than picking through keys we would not honour anyway.
+      if (segment.call === 'locator') {
+        if (args.length > 1) offenders.add('options');
+        continue;
+      }
 
-    // `locator('x', { hasText: … })` — the whole options object is ignored, so name it
-    // rather than picking through keys we would not honour anyway.
-    if (call === 'locator') return args.length > 1 ? ['options'] : [];
+      const source = args[1];
+      if (source === undefined) continue;
 
-    const source = args[1];
-    if (source === undefined) return [];
+      // Blank the literals first. An accessible name is free text and may contain anything —
+      // `{ name: 'Total, b: c' }` would otherwise read `b` as an option key and reject a
+      // perfectly good suggestion. Quotes before regexes, so a `/` inside a string is gone
+      // by the time regex literals are matched.
+      const stripped = source
+        .replace(/'(?:[^'\\]|\\.)*'/g, "''")
+        .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+        .replace(/`(?:[^`\\]|\\.)*`/g, '``')
+        .replace(/\/(?:\\.|[^/\\])+\/[gimsuy]*/g, '//');
 
-    // Blank the literals first. An accessible name is free text and may contain anything —
-    // `{ name: 'Total, b: c' }` would otherwise read `b` as an option key and reject a
-    // perfectly good suggestion. Quotes before regexes, so a `/` inside a string is gone
-    // by the time regex literals are matched.
-    const stripped = source
-      .replace(/'(?:[^'\\]|\\.)*'/g, "''")
-      .replace(/"(?:[^"\\]|\\.)*"/g, '""')
-      .replace(/`(?:[^`\\]|\\.)*`/g, '``')
-      .replace(/\/(?:\\.|[^/\\])+\/[gimsuy]*/g, '//');
+      const honoured = new Set(['name', 'exact', 'level']);
+      for (const match of stripped.matchAll(/(?:^|[{,\s])([A-Za-z_$][\w$]*)\s*:/g)) {
+        const key = match[1];
+        if (key !== undefined && !honoured.has(key)) offenders.add(key);
+      }
+    }
 
-    const honoured = new Set(['name', 'exact', 'level']);
-    const keys = [...stripped.matchAll(/(?:^|[{,\s])([A-Za-z_$][\w$]*)\s*:/g)]
-      .map((match) => match[1])
-      .filter((key): key is string => key !== undefined);
-
-    return [...new Set(keys.filter((key) => !honoured.has(key)))];
+    return [...offenders];
   }
 
   /**
-   * Whatever follows a complete `call(...)` at the start of an expression.
+   * Walks an expression into the chain of builder calls it is made of.
    *
-   * @param expression - Expression beginning with `call(`.
-   * @param call - The method name it begins with.
-   * @returns The trailing text, or `null` when the call is the whole expression.
-   * Unbalanced parentheses also yield `null` — that is reported separately, as a parse
-   * failure rather than an unsupported suffix.
+   * Left to right, because that is the order they are applied in: each segment scopes
+   * the next. Stops at the first thing it cannot interpret and hands it back verbatim,
+   * so the caller can refuse the expression *and say why* — a silently truncated chain
+   * resolving to a parent instead of a child is the failure this class exists to
+   * prevent, and is why only builder calls are walked.
+   *
+   * Chaining is accepted after a `getBy*` call only. A chained `.locator(...)` stays
+   * unsupported: heal-by-prefix for `locator()` chains is a separate, larger design
+   * question, and accepting the syntax here would imply support that is not built.
+   *
+   * @param expression - Expression with `await`, `page.` and any frame prefix removed.
+   * @returns The segments, plus whatever could not be read.
+   * @see CallChain
    */
-  private trailingAfterCall(expression: string, call: string): string | null {
-    const inner = this.extractCallArguments(expression, call);
-    if (inner === null) return null;
+  private splitCallChain(expression: string): CallChain {
+    const segments: ChainSegment[] = [];
+    let rest = expression.trim();
 
-    const rest = expression.slice(call.length + inner.length + 2).trim();
-    return rest === '' ? null : rest;
+    for (let first = true; ; first = false) {
+      const method = GET_BY_METHODS.find((candidate) => rest.startsWith(`${candidate}(`));
+      // A leading `locator('#x')` is a whole expression on its own; a chained one is not.
+      const call: GetByMethod | 'locator' | null =
+        method ?? (first && rest.startsWith('locator(') ? 'locator' : null);
+
+      if (!call) {
+        // Nothing consumed at all: bare CSS or XPath, which has its own grammar and is
+        // Playwright's to parse, not ours.
+        if (first) return { segments: [], unsupported: null, unbalanced: false };
+        return { segments, unsupported: rest, unbalanced: false };
+      }
+
+      const args = this.extractCallArguments(rest, call);
+      if (args === null) return { segments, unsupported: null, unbalanced: true };
+
+      rest = rest.slice(call.length + args.length + 2).trim();
+
+      // Refinements bind to the segment they follow, so `.nth(1)` here scopes the next
+      // call to one row rather than positioning the final result.
+      const refinements: Refinement[] = [];
+      for (;;) {
+        const match = /^\.(first|last|nth)\(\s*(\d+)?\s*\)/.exec(rest);
+        if (!match?.[1]) break;
+        const kind = match[1] as Refinement['kind'];
+        refinements.push(kind === 'nth' ? { kind, index: Number(match[2] ?? 0) } : { kind });
+        rest = rest.slice(match[0].length).trim();
+      }
+
+      segments.push({ call, args, refinements });
+
+      if (rest === '') return { segments, unsupported: null, unbalanced: false };
+      if (!rest.startsWith('.')) return { segments, unsupported: rest, unbalanced: false };
+
+      // Only a `getBy*` call may continue the chain. Anything else is handed back with
+      // its leading dot intact, because the reason reaches a model as the text to stop
+      // writing — `.filter({ … })` is recognisable, `filter({ … })` reads like a typo.
+      const next = rest.slice(1).trim();
+      if (!GET_BY_METHODS.some((candidate) => next.startsWith(`${candidate}(`))) {
+        return { segments, unsupported: rest, unbalanced: false };
+      }
+
+      rest = next;
+    }
   }
 
   /**
@@ -756,6 +880,46 @@ export class SelectorValidator {
   }
 
   /**
+   * Explains a zero match caused by pairing an accessible name with a role that
+   * cannot carry one.
+   *
+   * Called only after the expression has already matched nothing, so it never turns a
+   * working selector away — see {@link NAME_FROM_CONTENT_ROLES} for why the distinction
+   * is worth a dedicated message rather than a bare miss.
+   *
+   * @param selector - The expression that matched nothing, as the model wrote it.
+   * @returns A retry-ready explanation, or `null` when this is not the cause.
+   */
+  private nameOnUnnamedRole(selector: string): string | null {
+    // Same normalisation `resolve` applies, so the hint is decided about the expression
+    // that was actually run rather than the wrappers around it.
+    const expression = this.splitFrameChain(
+      selector.trim().replace(/^await\s+/, '').replace(/^(?:this\.)?page\./, '')
+    ).remainder;
+
+    if (!expression.startsWith('getByRole(')) return null;
+
+    const inner = this.extractCallArguments(expression, 'getByRole');
+    if (inner === null) return null;
+
+    const args = this.splitTopLevel(inner);
+    const role = args[0] === undefined ? null : this.parseStringLiteral(args[0]);
+    if (role === null || NAME_FROM_CONTENT_ROLES.has(role)) return null;
+
+    const name = args[1] === undefined ? undefined : this.parseOptions(args[1]).name;
+    if (name === undefined) return null;
+
+    const quoted = typeof name === 'string' ? `"${name}"` : String(name);
+
+    return (
+      `the "${role}" role takes no accessible name from its contents, so { name: ${quoted} } ` +
+      'excludes it. If the snapshot shows that name on a descendant — a link, button, ' +
+      'menuitem, tab, option or heading — target that descendant instead by its own role, ' +
+      'or drop the name and disambiguate another way'
+    );
+  }
+
+  /**
    * Extracts the `name`, `exact`, and `level` options from an options object
    * literal. Regex is sufficient here — these values are always primitives, and
    * anything unrecognised is ignored rather than guessed at.
@@ -794,49 +958,35 @@ export class SelectorValidator {
   }
 
   /**
-   * Removes every trailing positional refinement, not just the last one.
+   * Peels every trailing `.first()`, `.last()` or `.nth(n)` off a bare selector.
    *
-   * `getByRole('row').nth(2).first()` is legal Playwright, and `TestWrapper` produces it
-   * whenever a refined locator is refined again — so peeling one and calling the rest
-   * unsupported would reject expressions this package generates itself.
+   * Only for the no-builder-call path: inside a chain, a refinement belongs to the
+   * segment it follows and {@link splitCallChain} collects it there. Peeled
+   * right-to-left and unshifted, so the result is in source order — dropping all but
+   * the last of `.nth(2).first()` would resolve the *first* row rather than the third.
    *
-   * @param expression - Expression to inspect.
-   * @returns The refinements in application order, and what is left.
+   * A CSS pseudo-class is safe: the pattern requires a literal `.nth(`, so
+   * `li:nth-child(2)` is left alone.
+   *
+   * @param expression - A bare CSS or XPath selector, possibly refined.
+   * @returns The selector without refinements, and the refinements in source order.
    */
-  private stripRefinements(expression: string): { refinements: Refinement[]; remainder: string } {
+  private stripTrailingRefinements(
+    expression: string
+  ): { refinements: Refinement[]; remainder: string } {
     const refinements: Refinement[] = [];
     let remainder = expression;
 
     for (;;) {
-      const found = this.extractRefinement(remainder);
-      if (!found) break;
-      // Peeled right-to-left, so unshift restores source order.
-      refinements.unshift(found.value);
-      remainder = found.remainder;
+      const match = /\.(first|last|nth)\(\s*(\d+)?\s*\)\s*$/.exec(remainder);
+      if (!match?.[1]) break;
+
+      const kind = match[1] as Refinement['kind'];
+      refinements.unshift(kind === 'nth' ? { kind, index: Number(match[2] ?? 0) } : { kind });
+      remainder = remainder.slice(0, match.index).trim();
     }
 
     return { refinements, remainder };
-  }
-
-  /**
-   * Detects and removes a trailing `.first()`, `.last()`, or `.nth(n)`.
-   *
-   * @param expression - Expression to inspect.
-   * @returns The refinement plus the expression without it, or `null` if absent.
-   */
-  private extractRefinement(
-    expression: string
-  ): { value: Refinement; remainder: string } | null {
-    const match = /\.(first|last|nth)\(\s*(\d+)?\s*\)\s*$/.exec(expression);
-    if (!match) return null;
-
-    const kind = match[1] as Refinement['kind'];
-    const remainder = expression.slice(0, match.index).trim();
-
-    return {
-      value: kind === 'nth' ? { kind, index: Number(match[2] ?? 0) } : { kind },
-      remainder,
-    };
   }
 
   /**

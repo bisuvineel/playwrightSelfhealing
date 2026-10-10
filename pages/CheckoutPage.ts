@@ -32,7 +32,7 @@ export class CheckoutPage {
 
     // STALE: renamed to #submit-order-v3.
     this.placeOrderButton = page
-      .locator('#place-order-btn')
+      .locator('//button[text()="Place order"]')
       .describe('the button that submits the order');
 
     // Still valid.

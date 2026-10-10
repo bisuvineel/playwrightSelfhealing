@@ -108,6 +108,23 @@ const DESCRIPTION_KEY = '_healerDescription';
 /** Property used to carry the selector expression a locator was built from. */
 const EXPRESSION_KEY = '_healerExpression';
 
+/**
+ * Where a decorated page keeps its **undecorated** builder methods.
+ *
+ * A healed selector has to be turned back into a locator, and doing that through the
+ * page resolves it through the *decorated* builders — so the replacement arrives with
+ * wrapped actions, and a retry that also fails heals again. Measured before this
+ * existed: one stale selector produced **201 heals** and kept going. The default
+ * `HEALER_MAX_HEALS` eventually stopped it, meaning a single failing action consumed a
+ * whole worker's budget and a hundred provider calls; with the documented
+ * `HEALER_MAX_HEALS=0` it did not stop at all.
+ *
+ * The retry therefore builds from these. A healed locator is used exactly once, and a
+ * suggestion that does not work surfaces the original Playwright error — which is the
+ * contract — instead of starting again.
+ */
+const PRISTINE_KEY = '_healerPristineBuilders';
+
 /** A locator that can be annotated with intent for better healing. */
 export interface HealableLocator extends Locator {
   /**
@@ -160,6 +177,15 @@ export const HEAL_ANNOTATIONS = {
    * is a cost or availability decision rather than a policy, a key, or a bad suggestion.
    */
   skipped: 'heal-skipped',
+  /**
+   * The selector was not stale: it still resolved to exactly one visible element, so the
+   * action failed for another reason — the element appeared late, was covered, disabled,
+   * or still moving. No heal was attempted and the original error was re-thrown.
+   *
+   * Distinct from `heal-failed`, which means a stale selector found no replacement. This
+   * one means *do not rewrite the selector*: the fix is timing, an overlay, or state.
+   */
+  notStale: 'heal-not-needed',
 } as const;
 
 /** Resolver shared by every retry, for turning healed expressions into locators. */
@@ -277,6 +303,27 @@ let healsTestKey: string | null = null;
 let warnedAboutGateConfig = false;
 
 /**
+ * When the test in {@link healsTestKey} first decorated a page, in epoch milliseconds.
+ *
+ * `TestInfo` exposes the test's timeout but not when it started, and a heal needs both to
+ * know how long it may take. The first decoration happens during fixture setup, which
+ * Playwright already counts against the test's timeout, so this is at most a little late —
+ * the error runs toward allowing a heal, never toward refusing one.
+ */
+let testStartedAt: number | undefined;
+
+/**
+ * Time kept back from a heal for the action that follows it.
+ *
+ * A heal that succeeds still has to retry the action on the replacement, and a validated
+ * replacement acts at once. Two seconds covers that and the fixture teardown after it.
+ */
+const RETRY_RESERVE_MS = 2_000;
+
+/** Whether this worker has already warned that `actionTimeout` is unbounded. */
+let warnedAboutActionTimeout = false;
+
+/**
  * Starts, or continues, collecting heals for the current test.
  *
  * Called from every decoration entry point. Decorating twice within one test continues the
@@ -288,8 +335,72 @@ function beginHealCollection(): void {
 
   // Outside a test there is no key to compare, so reset — that is the global-setup path,
   // where nothing should carry into the first real test.
-  if (info === null || key !== healsTestKey) healsThisTest = [];
+  if (info === null || key !== healsTestKey) {
+    healsThisTest = [];
+    testStartedAt = info === null ? undefined : Date.now();
+  }
   healsTestKey = key;
+}
+
+/**
+ * The epoch millisecond by which a heal must finish, or `undefined` for no limit.
+ *
+ * The test's start plus its timeout, less {@link RETRY_RESERVE_MS} for the retried action.
+ * No limit when the test has no timeout (`0`) or its start is unknown.
+ *
+ * @param timeout - The test's timeout in milliseconds, as `testInfo.timeout` reports it.
+ * @param startedAt - When the test started, in epoch milliseconds.
+ * @returns The deadline.
+ */
+export function computeHealDeadline(timeout: number, startedAt: number | undefined): number | undefined {
+  if (startedAt === undefined || !(timeout > 0)) return undefined;
+  return startedAt + timeout - RETRY_RESERVE_MS;
+}
+
+/**
+ * The deadline for a heal starting now in the current test.
+ *
+ * Read at heal time rather than at decoration, because `test.setTimeout()` and
+ * `test.slow()` can change the timeout mid-test. Only used when the current test is the
+ * one {@link testStartedAt} was taken for: a page decorated in one test and used in the
+ * next — a worker-scoped page — gets no limit rather than a deadline from a test that is
+ * already over.
+ *
+ * @returns The deadline, or `undefined` for no limit.
+ */
+function currentHealDeadline(): number | undefined {
+  const info = currentTestInfo();
+  if (!info || `${info.testId}#${info.retry}` !== healsTestKey) return undefined;
+  return computeHealDeadline(info.timeout, testStartedAt);
+}
+
+/**
+ * Warns, once per worker, when actions have no timeout of their own.
+ *
+ * Playwright's default `actionTimeout` is `0`: an action waits for its element until the
+ * *test* times out. Healing runs only after an action fails, so with that default a stale
+ * selector exhausts the whole test timeout first and no heal ever gets to run. Said at
+ * warn level because nothing else would reveal it: the suite simply looks as though it
+ * never needed healing.
+ *
+ * Only for a healing page — with healing off the setting is none of this package's
+ * business.
+ *
+ * @param page - The page just decorated, or left alone.
+ * @param actionTimeout - The effective `actionTimeout`, when known.
+ */
+function warnIfActionTimeoutUnbounded(page: Page, actionTimeout: unknown): void {
+  if (warnedAboutActionTimeout) return;
+  if ((page as unknown as Record<string, unknown>)[PRISTINE_KEY] === undefined) return;
+  if (typeof actionTimeout === 'number' && actionTimeout > 0) return;
+
+  warnedAboutActionTimeout = true;
+  log.warn(
+    'actionTimeout is not set, so a stale selector waits for the whole test timeout and ' +
+      'healing never gets to run. Set use: { actionTimeout: 5_000 } (or similar) in ' +
+      'playwright.config — unless you already call page.setDefaultTimeout() or ' +
+      'context.setDefaultTimeout() yourself.'
+  );
 }
 
 /**
@@ -460,6 +571,17 @@ function toHealConfig(config: Config): HealConfig {
     privacy: config.privacy,
     intent: config.intent,
     cache: config.healing.cache,
+    // Both are optional on `HealConfig` so a hand-built config keeps its old behaviour —
+    // which means the compiler cannot insist on them here. They were missing from this
+    // builder and from `createHealingEngine` when first added, so on the path every
+    // fixture user takes, HEALER_MAX_SNAPSHOT_CHARS and HEALER_CANDIDATES were read,
+    // logged at startup, and never applied. Measured through preview mode: a 1,000-
+    // character ceiling sent 31,872 characters. `tests/unit/settings-reach-engine.test.js`
+    // now proves every such setting end to end, so this cannot recur silently.
+    maxSnapshotChars: config.healing.maxSnapshotChars,
+    candidates: config.healing.candidates,
+    confirm: config.healing.confirm,
+    ...(config.healing.confirmModel !== undefined ? { confirmModel: config.healing.confirmModel } : {}),
     budget: {
       maxHeals: config.healing.maxHeals,
       breakerThreshold: config.healing.breakerThreshold,
@@ -677,6 +799,17 @@ async function publishOutcome(outcome: HealOutcome): Promise<void> {
   // Also nothing transmitted, but for a cost or availability reason rather than a policy
   // one — worth separating, because the responses differ: raise a ceiling, or go and look
   // at why the provider is down.
+  if (outcome.notStale) {
+    info.annotations.push({
+      type: HEAL_ANNOTATIONS.notStale,
+      description:
+        `${outcome.action}(): "${outcome.originalSelector}" still matches its element, so it ` +
+        'was not healed — the action failed on timing, an overlay, or a disabled control, and ' +
+        `the original error below names which. Do not rewrite this selector. At ${at}`,
+    });
+    return;
+  }
+
   if (outcome.skipped) {
     info.annotations.push({
       type: HEAL_ANNOTATIONS.skipped,
@@ -789,6 +922,8 @@ async function publishOutcome(outcome: HealOutcome): Promise<void> {
  */
 export function resetHealingEngine(): void {
   engine = undefined;
+  // A fresh engine is a fresh worker as far as the once-per-worker advice goes.
+  warnedAboutActionTimeout = false;
 }
 
 /**
@@ -943,7 +1078,78 @@ function wrapAction(
     }
   };
 
+  /**
+   * Resolves a healed selector to a locator whose actions are *not* wrapped.
+   *
+   * Against the undecorated builders, so the replacement has plain actions. Going through
+   * `page` here handed back a decorated locator whose failure healed again, unbounded —
+   * see PRISTINE_KEY. Falls back to `page` only for a page this function never decorated,
+   * which cannot be the healing path but keeps the helper total.
+   *
+   * @param healed - The replacement selector.
+   * @returns The replacement's action method, or `null` when it cannot be resolved.
+   */
+  const replacementAction = (healed: string): ((...a: unknown[]) => Promise<unknown>) | null => {
+    const root = (page as unknown as Record<string, unknown>)[PRISTINE_KEY];
+    const replacement = resolver.resolve(healed, (root ?? page) as Page);
+    if (!replacement) return null;
+
+    const retryTarget = replacement as unknown as Record<
+      string,
+      ((...a: unknown[]) => Promise<unknown>) | undefined
+    >;
+    if (typeof retryTarget[action] !== 'function') return null;
+
+    // Property-call form, so a failure on the retry is also labelled with the real action
+    // name. The replacement is built from the pristine builders, so its actions are
+    // unwrapped and there is nothing to remove.
+    return (...a: unknown[]) => retryTarget[action]!(...a);
+  };
+
+  /**
+   * Acts on a heal this worker already made for this selector, without first waiting out
+   * the action's timeout on the stale original.
+   *
+   * The cache used to save the provider call and nothing else: each later use of a stale
+   * locator still ran its action to the full `actionTimeout` before healing began. The
+   * engine probes the original for a quarter of a second instead, and answers only when it
+   * is still stale and a cached replacement validates here.
+   *
+   * @param args - The action's arguments.
+   * @returns `{ value }` when the reused heal ran, or `null` for the normal path.
+   */
+  const reuseKnown = async (args: unknown[]): Promise<{ value: unknown } | null> => {
+    // Feature-detected: an engine installed with setHealingEngine() may predate these.
+    const engine = healingEngine as Partial<HealingEngine>;
+    if (typeof engine.hasKnownHeal !== 'function' || typeof engine.reuseKnownHeal !== 'function') {
+      return null;
+    }
+
+    const selector = locator[EXPRESSION_KEY] ?? '';
+    if (!engine.hasKnownHeal(selector)) return null;
+
+    const reuse = async (): Promise<HealOutcome | null> => {
+      const outcome = await engine.reuseKnownHeal!(page, selector, action, locator[DESCRIPTION_KEY]);
+      if (outcome?.healed) await publishOutcome(outcome);
+      return outcome;
+    };
+
+    const outcome = currentTestInfo()
+      ? await base.step(`heal ${action}() on "${selector}"`, reuse, { box: true })
+      : await reuse();
+    if (!outcome?.healed) return null;
+
+    const run = replacementAction(outcome.healed);
+    if (!run) return null;
+
+    log.info(`Using the known heal for "${selector}": "${forDisplay(outcome.healed)}".`);
+    return { value: await run(...args) };
+  };
+
   const wrapped = async function (this: unknown, ...args: unknown[]): Promise<unknown> {
+    const known = await reuseKnown(args);
+    if (known) return known.value;
+
     try {
       return await callOriginal(args);
     } catch (error) {
@@ -960,14 +1166,19 @@ function wrapAction(
       // attemptHealDetailed never throws and returns the full outcome, which is what
       // the report needs. Publishing here rather than through an engine callback means
       // a caller-supplied engine (setHealingEngine) reports identically.
+      let notStale = false;
+
       const heal = async (): Promise<string | null> => {
+        const deadline = currentHealDeadline();
         const outcome = await healingEngine.attemptHealDetailed(
           page,
           selector,
           action,
           description,
-          originalError
+          originalError,
+          deadline !== undefined ? { deadline } : {}
         );
+        notStale = outcome.notStale === true;
         await publishOutcome(outcome);
         return outcome.healed;
       };
@@ -976,27 +1187,35 @@ function wrapAction(
         ? await base.step(`heal ${action}() on "${selector}"`, heal, { box: true })
         : await heal();
 
+      // The selector was never stale: it resolves to exactly one visible element. So the
+      // test's own selector gets one more attempt, exactly as written.
+      //
+      // Safe because a timed-out Playwright action performed nothing — actions dispatch
+      // only once actionability checks pass — so this cannot double-click or double-fill.
+      // It resolves the one case a recheck can see late: an element that rendered while
+      // the provider was answering, which now passes on its own selector rather than
+      // being healed onto a lookalike. An overlay or a disabled control fails again,
+      // which is right, and the error the test sees is Playwright's, naming the cause.
+      //
+      // `callOriginal` reaches the underlying method directly, so a second failure is
+      // reported as-is rather than healed again.
+      if (!healed && notStale) {
+        log.info(`Retrying ${action}() on "${selector}" as written: the selector was not stale.`);
+        return await callOriginal(args);
+      }
+
       if (!healed) throw error;
 
       // Resolve through the validator: the AI answers with getBy* expressions that
       // page.locator() cannot parse.
-      const replacement = resolver.resolve(healed, page);
-      if (!replacement) {
+      const run = replacementAction(healed);
+      if (!run) {
         log.error(`Healed selector "${healed}" could not be resolved — rethrowing.`);
         throw error;
       }
 
       log.info(`Retrying ${action}() with healed selector "${forDisplay(healed)}".`);
-
-      const retryTarget = replacement as unknown as Record<
-        string,
-        ((...a: unknown[]) => Promise<unknown>) | undefined
-      >;
-      if (typeof retryTarget[action] !== 'function') throw error;
-
-      // Property-call form again, so a failure on the retry is also labelled with
-      // the real action name. `replacement` is undecorated, so nothing to remove.
-      return await retryTarget[action]!(...args);
+      return await run(...args);
     }
   };
 
@@ -1194,6 +1413,18 @@ function decorateFrameLocator(
 function decoratePage(page: Page, healingEngine: HealingEngine): void {
   const target = page as unknown as Record<string, unknown>;
 
+  // Captured first, while the originals are still in place: the retry path resolves a
+  // healed selector against these so its replacement is not itself healable. See
+  // PRISTINE_KEY.
+  const pristine: Record<string, unknown> = {};
+  for (const method of ['locator', 'frameLocator', ...GET_BY_METHODS]) {
+    const original = target[method];
+    if (typeof original === 'function') {
+      pristine[method] = (original as (...a: unknown[]) => unknown).bind(page);
+    }
+  }
+  target[PRISTINE_KEY] = pristine;
+
   // page.locator(selector, options?)
   const originalLocator = page.locator.bind(page);
   target['locator'] = (selector: string, options?: Parameters<Page['locator']>[1]): HealableLocator =>
@@ -1244,10 +1475,32 @@ export function applyHealing(
   testInfo: TestInfo,
   healingEngine: HealingEngine | null = initializeHealingEngine()
 ): Page {
+  return applyHealingWith(page, testInfo, healingEngine, projectActionTimeout(testInfo));
+}
+
+/**
+ * {@link applyHealing}, given the effective `actionTimeout`.
+ *
+ * The shipped fixtures read it from Playwright's own `actionTimeout` fixture, which sees
+ * `test.use()` overrides; a direct caller gets the project's value.
+ *
+ * @param page - Page to decorate, mutated in place.
+ * @param testInfo - Current test, annotated when healing is unavailable.
+ * @param healingEngine - Engine to use.
+ * @param actionTimeout - The effective `actionTimeout`, when known.
+ * @returns The same page.
+ */
+function applyHealingWith(
+  page: Page,
+  testInfo: TestInfo,
+  healingEngine: HealingEngine | null,
+  actionTimeout: unknown
+): Page {
   beginHealCollection();
 
   if (healingEngine) {
     decoratePage(page, healingEngine);
+    warnIfActionTimeoutUnbounded(page, actionTimeout);
   } else {
     // Say so in the report rather than only in stdout: a suite that quietly stopped
     // healing looks identical to one that never needed to.
@@ -1258,6 +1511,20 @@ export function applyHealing(
   }
 
   return page;
+}
+
+/**
+ * The `actionTimeout` the project configures, when a test is running.
+ *
+ * @param info - The current test, if any.
+ * @returns The configured value, or `undefined`.
+ */
+function projectActionTimeout(info: TestInfo | null | undefined): unknown {
+  try {
+    return info?.project?.use?.actionTimeout;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -1288,6 +1555,7 @@ export function attachHealing(
 
   if (healingEngine) {
     decoratePage(page, healingEngine);
+    warnIfActionTimeoutUnbounded(page, projectActionTimeout(currentTestInfo()));
     return page;
   }
 
@@ -1329,11 +1597,11 @@ export interface HealingFixtures {
  */
 export const healingFixtures = {
   page: async (
-    { page }: { page: Page },
+    { page, actionTimeout }: { page: Page; actionTimeout: number },
     use: (page: Page) => Promise<void>,
     testInfo: TestInfo
   ): Promise<void> => {
-    await use(applyHealing(page, testInfo));
+    await use(applyHealingWith(page, testInfo, initializeHealingEngine(), actionTimeout));
     // After the body, so one run reports every stale selector. A throw here fails a
     // test whose body passed, and is reported *alongside* a body failure rather than
     // replacing it — verified against Playwright.
@@ -1363,11 +1631,11 @@ export const healingFixtures = {
 export function withHealing<T extends TestTypeLike>(existing: T): T {
   return (existing as TestTypeLike).extend({
     page: async (
-      { page }: { page: Page },
+      { page, actionTimeout }: { page: Page; actionTimeout: number },
       use: (page: Page) => Promise<void>,
       testInfo: TestInfo
     ) => {
-      await use(applyHealing(page, testInfo));
+      await use(applyHealingWith(page, testInfo, initializeHealingEngine(), actionTimeout));
       assertNoHeals();
     },
   }) as T;
@@ -1496,6 +1764,27 @@ export interface HealingOptions {
    */
   intentCheck?: IntentMode;
   /**
+   * Offer the model a numbered list of elements to pick from. Defaults to
+   * `HEALER_CANDIDATES`, then `true`. See {@link HealConfig.candidates}.
+   */
+  candidates?: boolean;
+  /**
+   * Ask a second, narrow question before accepting a heal. Defaults to
+   * `HEALER_CONFIRM`, then `true`. See {@link HealConfig.confirm}.
+   */
+  confirm?: boolean;
+  /**
+   * Model for the second opinion. Defaults to `HEALER_CONFIRM_MODEL`, then
+   * `claude-sonnet-5` on Anthropic, then the healing model. See {@link HealConfig.confirmModel}.
+   */
+  confirmModel?: string;
+  /**
+   * Ceiling on the snapshot sent with a prompt, in characters; `0` is unlimited.
+   * Defaults to `HEALER_MAX_SNAPSHOT_CHARS`, then 40,000. See
+   * {@link HealConfig.maxSnapshotChars}.
+   */
+  maxSnapshotChars?: number;
+  /**
    * Confidence required when nothing about a heal can be verified. Defaults to
    * `HEALER_UNVERIFIED_CONFIDENCE` (0.9).
    */
@@ -1580,6 +1869,19 @@ export function createHealingEngine(options: HealingOptions = {}): HealingEngine
       privacy,
       intent,
       cache: options.cache ?? base.cache ?? true,
+      // See the note in `toHealConfig`: these must be forwarded explicitly.
+      ...(options.maxSnapshotChars !== undefined || base.maxSnapshotChars !== undefined
+        ? { maxSnapshotChars: options.maxSnapshotChars ?? (base.maxSnapshotChars as number) }
+        : {}),
+      ...(options.candidates !== undefined || base.candidates !== undefined
+        ? { candidates: options.candidates ?? (base.candidates as boolean) }
+        : {}),
+      ...(options.confirm !== undefined || base.confirm !== undefined
+        ? { confirm: options.confirm ?? (base.confirm as boolean) }
+        : {}),
+      ...(options.confirmModel !== undefined || base.confirmModel !== undefined
+        ? { confirmModel: options.confirmModel ?? (base.confirmModel as string) }
+        : {}),
       budget: {
         maxHeals: options.maxHeals ?? base.budget?.maxHeals ?? 0,
         breakerThreshold: options.breakerThreshold ?? base.budget?.breakerThreshold ?? 0,
@@ -1638,12 +1940,12 @@ export function createHealingFixtures(options: HealingOptions = {}): typeof heal
 
   return {
     page: async (
-      { page }: { page: Page },
+      { page, actionTimeout }: { page: Page; actionTimeout: number },
       use: (page: Page) => Promise<void>,
       testInfo: TestInfo
     ): Promise<void> => {
       if (configured === undefined) configured = createHealingEngine(options);
-      await use(applyHealing(page, testInfo, configured));
+      await use(applyHealingWith(page, testInfo, configured, actionTimeout));
       assertNoHeals(options.failOnHeal);
     },
   };

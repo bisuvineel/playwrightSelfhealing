@@ -60,6 +60,154 @@ export class HttpError extends Error {
 }
 
 /**
+ * TLS failure codes that mean "this process does not trust the certificate it was shown".
+ *
+ * Almost always a corporate network that inspects HTTPS by re-signing it with its own
+ * root certificate. Browsers and `curl` on Windows trust that root through the operating
+ * system's store; **Node does not** — it ships its own CA list. So on the same machine
+ * `curl https://api.anthropic.com` answers and every heal fails. Reproduced on the
+ * machine this package is developed on:
+ *
+ * ```
+ *   curl                        → HTTP 401 in 0.77s
+ *   node  fetch()               → UNABLE_TO_GET_ISSUER_CERT_LOCALLY
+ *   node --use-system-ca fetch  → HTTP 401
+ * ```
+ *
+ * Before this existed the failure read `could not reach api.anthropic.com: fetch failed`
+ * — indistinguishable from an outage — and was retried with backoff on every attempt of
+ * every heal, for a condition that cannot clear on its own.
+ */
+const TLS_TRUST_CODES: ReadonlySet<string> = new Set([
+  'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+  'UNABLE_TO_GET_ISSUER_CERT',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'SELF_SIGNED_CERT_IN_CHAIN',
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'CERT_UNTRUSTED',
+  'CERT_HAS_EXPIRED',
+  'ERR_TLS_CERT_ALTNAME_INVALID',
+]);
+
+/**
+ * Reads the system error code from a failed `fetch`.
+ *
+ * `fetch` rejects with a bare `TypeError: fetch failed` and puts the reason on `cause`,
+ * sometimes one level further down. Reporting only the message discards the one piece of
+ * information that says what to do.
+ *
+ * @param error - Whatever `fetch` rejected with.
+ * @returns The code, e.g. `ENOTFOUND` or `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`.
+ */
+export function networkCauseCode(error: unknown): string | undefined {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current !== null && typeof current === 'object'; depth++) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === 'string' && code !== '') return code;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/**
+ * The provider's certificate is not trusted by this Node process.
+ *
+ * Its own type so a caller — the setup checker, a report — can recognise it and give the
+ * fix rather than a generic network message. Never retried. See {@link TLS_TRUST_CODES}.
+ */
+export class TlsTrustError extends Error {
+  constructor(
+    readonly label: string,
+    readonly host: string,
+    readonly code: string
+  ) {
+    super(
+      `${label} could not reach ${host}: its TLS certificate is not trusted by Node ` +
+        `(${code}). This is almost always a network that inspects HTTPS with its own ` +
+        'root certificate — browsers and curl trust it through the operating system, Node ' +
+        'does not. Fix: run with NODE_OPTIONS=--use-system-ca (Node 22.15+ or 23.8+), or ' +
+        "set NODE_EXTRA_CA_CERTS to a PEM file holding your organisation's root " +
+        'certificate. Not retried: a trust failure does not clear on its own.'
+    );
+    this.name = 'TlsTrustError';
+  }
+}
+
+/**
+ * A provider failure caused by configuration, which no retry — and no later heal in the
+ * same process — can fix.
+ *
+ * Provider errors come in two classes, and treating them as one was measured to be
+ * expensive. **Transient** failures — a 429, a 5xx, a reset connection, a timeout — can
+ * clear, so they are retried and counted toward the circuit breaker. **Configuration**
+ * failures — an untrusted certificate, a rejected key, a model that does not exist —
+ * fail identically every time. Before this type existed they were retried like the
+ * first class: a healing run on a machine behind HTTPS inspection made two doomed calls
+ * per stale selector per test, and with four workers each seeing only a couple of
+ * failures, the per-worker breaker never tripped at all.
+ *
+ * Providers flatten errors into messages for people to read, which is exactly what
+ * stops an engine from telling a bad key from a timeout. This type carries the
+ * classification through that flattening; the engine switches healing off for the rest
+ * of the worker on the first one, with the provider's own actionable message as the
+ * reason.
+ */
+export class ProviderConfigurationError extends Error {
+  constructor(
+    message: string,
+    readonly cause?: unknown
+  ) {
+    super(message);
+    this.name = 'ProviderConfigurationError';
+  }
+}
+
+/**
+ * Whether a failed provider call failed because of configuration.
+ *
+ * Deliberately narrow — a false positive switches healing off for the rest of a worker,
+ * so only failures that cannot change within a run are included:
+ *
+ * - an untrusted TLS certificate ({@link TlsTrustError});
+ * - 401 and 403: a rejected credential, a key without access to the model, or a proxy
+ *   answering in the provider's place — none of which changes mid-run;
+ * - 404: a model or deployment that does not exist;
+ * - 429 with OpenAI's `insufficient_quota`: out of credit, which looks like a rate limit
+ *   but will not recover on backoff;
+ * - 400 carrying Gemini's `API_KEY_INVALID` (its bad-key signal is a 400, not a 401) or
+ *   Anthropic's credit-balance error.
+ *
+ * Every other status, and every network failure that is not a certificate problem, is
+ * transient and handled as before.
+ *
+ * @param error - Whatever the HTTP layer threw.
+ * @returns True when retrying cannot help.
+ */
+export function isConfigurationFailure(error: unknown): boolean {
+  if (error instanceof TlsTrustError) return true;
+  if (!(error instanceof HttpError)) return false;
+
+  if (error.status === 401 || error.status === 403 || error.status === 404) return true;
+  if (error.status === 429) return /insufficient_quota/i.test(error.body);
+  if (error.status === 400) return /API_KEY_INVALID|credit balance/i.test(error.body);
+
+  return false;
+}
+
+/**
+ * Keeps a failure's classification when a provider rewrites it for display.
+ *
+ * @param original - The error the HTTP layer threw.
+ * @param described - The provider's human-readable rewrite of it.
+ * @returns `described`, or a {@link ProviderConfigurationError} carrying its message.
+ */
+export function asProviderFailure(original: unknown, described: Error): Error {
+  return isConfigurationFailure(original)
+    ? new ProviderConfigurationError(described.message, original)
+    : described;
+}
+
+/**
  * A 2xx response whose body was not JSON — usually an HTML error page injected by a
  * proxy or captive portal. Distinct from a network failure so it is not reported as
  * one, and not retried: the endpoint answered, it just answered with the wrong thing.
@@ -240,11 +388,19 @@ export async function postJson<T>(options: PostJsonOptions): Promise<T> {
       const isAbort = error instanceof Error && error.name === 'AbortError';
       if (isAbort && signal?.aborted) throw new RequestCancelledError(label);
 
+      const host = new URL(url).host;
+      const code = isAbort ? undefined : networkCauseCode(error);
+
+      // A certificate the process does not trust is configuration, not weather: it
+      // fails identically on every attempt, so retrying only adds backoff to every heal.
+      // Thrown at once, with the fix in the message.
+      if (code !== undefined && TLS_TRUST_CODES.has(code)) throw new TlsTrustError(label, host, code);
+
       const detail = isAbort
         ? `${label} timed out after ${timeoutMs}ms`
-        : `${label} could not reach ${new URL(url).host}: ${
+        : `${label} could not reach ${host}: ${
             error instanceof Error ? error.message : String(error)
-          }`;
+          }${code !== undefined ? ` (${code})` : ''}`;
 
       const wrapped = new Error(detail);
       if (attempt === maxRetries) throw wrapped;

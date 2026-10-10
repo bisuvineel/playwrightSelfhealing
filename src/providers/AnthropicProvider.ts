@@ -18,7 +18,7 @@
 
 import { AiProvider, type HealOptions } from '../core/AiProvider';
 import type { HealingRequest, HealingResponse } from '../types';
-import { HttpError, postJson } from './httpJson';
+import { asProviderFailure, HttpError, postJson } from './httpJson';
 
 /** Default API root. Overridden by `ANTHROPIC_BASE_URL` or the `baseUrl` option. */
 const DEFAULT_BASE_URL = 'https://api.anthropic.com/v1';
@@ -43,8 +43,29 @@ const THINKING_MODEL_PATTERN =
 /** Output ceiling used on thinking-capable models. */
 const THINKING_MAX_TOKENS = 4_096;
 
+/**
+ * Models that accept `temperature`, so a heal can be made repeatable.
+ *
+ * An **allowlist**, because the two failure modes are not symmetric. Opus 4.7 and later,
+ * Opus 5, Sonnet 5 and the Fable/Mythos models have removed sampling parameters and
+ * return a 400 if one is sent — a denylist that missed a new model would break every
+ * heal on it, while an allowlist that misses one only leaves it at the default sampling.
+ * Models in {@link THINKING_MODEL_PATTERN} are left out even where they would accept it:
+ * they are sent `output_config.effort`, and that combination is not one this package has
+ * verified.
+ *
+ * Why it matters: with no temperature set, the same stale selector on the same page can
+ * be healed differently on two runs of the same commit — and a test tool whose results
+ * depend on sampling is not reproducible.
+ */
+const SAMPLING_MODEL_PATTERN =
+  /^claude-(?:haiku-4-5|sonnet-4-5|opus-4-5|opus-4-1|sonnet-4-0|opus-4-0|sonnet-4-2025|opus-4-2025|3-)/;
+
 /** Output ceiling for the throwaway request made by {@link AnthropicProvider.validateConfig}. */
 const VALIDATION_MAX_TOKENS = 16;
+
+/** Output ceiling for the second-opinion check: a boolean and one sentence. */
+const CONFIRM_MAX_TOKENS = 150;
 
 /** Optional tuning. */
 export interface AnthropicProviderOptions {
@@ -60,12 +81,19 @@ export interface AnthropicProviderOptions {
 
 /** The subset of the Messages API response this provider reads. */
 interface MessagesResponse {
+  /** The model that served the request — a dated snapshot when an alias was requested. */
+  model?: string;
   content?: Array<{ type?: string; text?: string }>;
   stop_reason?: string;
   stop_details?: { type?: string; category?: string | null } | null;
   usage?: {
+    /** Input tokens that were **not** served from the cache. */
     input_tokens?: number | null;
     output_tokens?: number | null;
+    /** Input tokens written to the cache on this request. */
+    cache_creation_input_tokens?: number | null;
+    /** Input tokens served from the cache on this request. */
+    cache_read_input_tokens?: number | null;
   };
 }
 
@@ -81,14 +109,14 @@ export class AnthropicProvider extends AiProvider {
   /**
    * @param apiKey - Anthropic API key. Required — unlike the SDK, there is no ambient
    * credential source, so an empty key fails in {@link validateConfig}.
-   * @param model - Model to heal with. Defaults to `claude-haiku-4-5`, matching the
+   * @param model - Model to heal with. Defaults to `claude-haiku-4-5-20251001`, matching the
    * framework config default: healing is a high-volume, narrowly scoped task, so the
    * cheapest capable model is the right choice. Override with `ANTHROPIC_MODEL`.
    * @param options - See {@link AnthropicProviderOptions}.
    */
   constructor(
     apiKey: string,
-    model: string = 'claude-haiku-4-5',
+    model: string = 'claude-haiku-4-5-20251001',
     options: AnthropicProviderOptions = {}
   ) {
     super(apiKey, model);
@@ -133,7 +161,9 @@ export class AnthropicProvider extends AiProvider {
         ...(options.signal ? { signal: options.signal } : {}),
       });
     } catch (error) {
-      throw this.describeError(error, 'Healing request failed');
+      // Classified on the original error, before it is rewritten for display: a rejected
+      // key or an untrusted certificate must switch healing off, not be retried.
+      throw asProviderFailure(error, this.describeError(error, 'Healing request failed'));
     }
 
     // A refusal is a successful HTTP call with no answer — surface it explicitly
@@ -162,26 +192,49 @@ export class AnthropicProvider extends AiProvider {
       .trim();
 
     const parsed = this.parseResponse(text);
-    if (!parsed.suggestedSelector) {
+    // Throw only when there is no answer at all. `parseResponse` leaves `confidence`
+    // unset exactly when it found no usable JSON object, which is a malformed reply.
+    //
+    // A parsed answer that names nothing is not malformed — it is a **refusal**, and the
+    // prompt asks for one: "if no element on the page plausibly matches, return confidence
+    // 0". Throwing on it treated the model's most careful answer as an outage. Measured
+    // against the real claude-haiku-4-5 refusal: three honest refusals opened the circuit
+    // breaker, healing stopped for the rest of the run on a healthy provider, ~9,000 tokens
+    // were billed and none recorded, and the model's reasoning — the one thing a human
+    // needed — was discarded. After a redesign several elements genuinely are gone, so it
+    // fired exactly when healing mattered most. The engine now reports a refusal as one.
+    if (parsed.confidence === undefined) {
       throw new Error(
-        `Claude returned no usable selector (stop_reason: ${response.stop_reason ?? 'unknown'}).`
+        `Claude returned no usable answer (stop_reason: ${response.stop_reason ?? 'unknown'}).`
       );
     }
 
     const result: HealingResponse = {
-      suggestedSelector: parsed.suggestedSelector,
+      // Empty when the model answered with an id alone; `HealingEngine.resolveChoices`
+      // fills it in from the candidate that id names.
+      suggestedSelector: parsed.suggestedSelector ?? '',
       confidence: parsed.confidence ?? 0,
       reasoning: parsed.reasoning ?? '',
+      ...(parsed.candidateId !== undefined ? { candidateId: parsed.candidateId } : {}),
+      ...(parsed.alternatives !== undefined ? { alternatives: parsed.alternatives } : {}),
       // Spread-in rather than assigned: `exactOptionalPropertyTypes` rejects an
       // explicit `undefined` on an optional field, and the intent check treats a
       // missing claim differently from an empty one.
       ...(parsed.expectedRole !== undefined ? { expectedRole: parsed.expectedRole } : {}),
       ...(parsed.expectedName !== undefined ? { expectedName: parsed.expectedName } : {}),
+      // `input_tokens` is only the uncached share once caching engages, so the three are
+      // summed: recording it alone would make every heal look cheaper than it was.
       tokenUsage: {
-        input: response.usage?.input_tokens ?? 0,
+        input:
+          (response.usage?.input_tokens ?? 0) +
+          (response.usage?.cache_creation_input_tokens ?? 0) +
+          (response.usage?.cache_read_input_tokens ?? 0),
         output: response.usage?.output_tokens ?? 0,
+        ...(response.usage?.cache_read_input_tokens
+          ? { cached: response.usage.cache_read_input_tokens }
+          : {}),
       },
-      provider: `anthropic:${this.model}`,
+      provider: `anthropic:${this.servedModel(response.model)}`,
     };
 
     // The suggestion itself is deliberately absent. A provider sits below the privacy
@@ -192,7 +245,10 @@ export class AnthropicProvider extends AiProvider {
       `Answered for "${request.originalSelector}" with confidence ${result.confidence} — ` +
         `${result.tokenUsage.input} in / ${result.tokenUsage.output} out tokens.`
     );
-    this.logDebug(`Suggested selector: ${result.suggestedSelector}`);
+    this.logDebug(
+      `Suggested: ${result.candidateId !== undefined ? `candidate ${result.candidateId}` : result.suggestedSelector}` +
+        `${result.alternatives?.length ? ` (+${result.alternatives.length} alternative(s))` : ''}`
+    );
 
     return result;
   }
@@ -240,6 +296,65 @@ export class AnthropicProvider extends AiProvider {
     }
   }
 
+  /**
+   * One plain exchange, for the second-opinion check. Same transport, deadline, model
+   * and sampling rules as {@link heal}; no cache breakpoints, since the prompt is short.
+   *
+   * @param system - System prompt.
+   * @param user - User prompt.
+   * @param options - Per-call controls.
+   * @returns The reply text, cost and served model.
+   */
+  protected async complete(
+    system: string,
+    user: string,
+    options: HealOptions = {}
+  ): Promise<{ text: string; tokenUsage: HealingResponse['tokenUsage']; provider: string }> {
+    // The capability rules follow the model actually called, which for the second
+    // opinion is usually not the one configured for healing.
+    const model = options.model ?? this.model;
+    const supportsEffort = THINKING_MODEL_PATTERN.test(model);
+
+    let response: MessagesResponse;
+    try {
+      response = await postJson<MessagesResponse>({
+        url: `${this.baseUrl}/messages`,
+        headers: this.buildHeaders(),
+        body: {
+          model,
+          max_tokens: supportsEffort ? THINKING_MAX_TOKENS : CONFIRM_MAX_TOKENS,
+          system,
+          messages: [{ role: 'user', content: user }],
+          ...(supportsEffort ? { output_config: { effort: 'low' } } : {}),
+          ...(!supportsEffort && SAMPLING_MODEL_PATTERN.test(model) ? { temperature: 0 } : {}),
+        },
+        timeoutMs: this.timeoutMs,
+        maxRetries: this.maxRetries,
+        ...(this.fetchImpl ? { fetchImpl: this.fetchImpl } : {}),
+        label: 'Anthropic confirmation request',
+        ...(options.signal ? { signal: options.signal } : {}),
+      });
+    } catch (error) {
+      throw asProviderFailure(error, this.describeError(error, 'Confirmation request failed'));
+    }
+
+    return {
+      text: (response.content ?? [])
+        .filter((block) => block.type === 'text')
+        .map((block) => block.text ?? '')
+        .join('\n')
+        .trim(),
+      tokenUsage: {
+        input:
+          (response.usage?.input_tokens ?? 0) +
+          (response.usage?.cache_creation_input_tokens ?? 0) +
+          (response.usage?.cache_read_input_tokens ?? 0),
+        output: response.usage?.output_tokens ?? 0,
+      },
+      provider: `anthropic:${this.servedModel(response.model)}`,
+    };
+  }
+
   /** Auth and version headers for every request. */
   private buildHeaders(): Record<string, string> {
     return {
@@ -262,12 +377,32 @@ export class AnthropicProvider extends AiProvider {
       this.logDebug(`Using effort=low with max_tokens=${maxTokens} for ${this.model}.`);
     }
 
+    const { page, question } = this.buildUserPromptParts(request);
+
+    // Two cache breakpoints: one after the system prompt, which is identical on every
+    // heal, and one after the page, which is identical across every attempt at one heal
+    // and across consecutive heals on the same page. A prefix below the model's minimum
+    // cacheable length is simply not cached — no error — and on Claude Haiku 4.5 that
+    // minimum is 4,096 tokens, more than a typical heal sends, so on Haiku the benefit is
+    // confined to large pages. `tokenUsage.cached` says whether it engaged.
     return {
       model: this.model,
       max_tokens: maxTokens,
-      system: this.buildSystemPrompt(),
-      messages: [{ role: 'user', content: this.buildUserPrompt(request) }],
+      system: [
+        { type: 'text', text: this.buildSystemPrompt(request), cache_control: { type: 'ephemeral' } },
+      ],
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: page, cache_control: { type: 'ephemeral' } },
+            { type: 'text', text: question },
+          ],
+        },
+      ],
       ...(supportsEffort ? { output_config: { effort: 'low' } } : {}),
+      // Repeatable heals where the model allows it. See SAMPLING_MODEL_PATTERN.
+      ...(!supportsEffort && SAMPLING_MODEL_PATTERN.test(this.model) ? { temperature: 0 } : {}),
     };
   }
 

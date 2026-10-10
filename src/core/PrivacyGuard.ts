@@ -44,7 +44,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
-import type { HealingRequest, PrivacyPolicy, RedactionField, RedactLevel } from '../types';
+import type {
+  ElementCandidate,
+  HealingRequest,
+  PrivacyPolicy,
+  RedactionField,
+  RedactLevel,
+} from '../types';
 import { createLogger, type Logger } from '../utils/logger';
 import { relativeToProject } from '../utils/paths';
 
@@ -350,10 +356,153 @@ export class PrivacyGuard {
       ...(request.error !== undefined
         ? { error: this.scrubErrorMessage(request.error, pageUrl) }
         : {}),
+      ...(request.candidates !== undefined
+        ? { candidates: this.scrubCandidates(request.candidates, pageUrl) }
+        : {}),
+      // Literals lifted from the test's own selector, which is source rather than page
+      // content — scrubbed like the selector itself, and for the same reason.
+      ...(request.missingText !== undefined
+        ? { missingText: request.missingText.map((text) => this.scrub(text, 'selector', pageUrl)) }
+        : {}),
       // screenshot: intentionally never propagated. See the note above.
     };
 
     return outbound;
+  }
+
+  /**
+   * Redacts the candidate list, and drops the locators from it.
+   *
+   * Two jobs. The **locator never travels**: the model answers with an id, so the
+   * expression is of no use to it, and keeping the id-to-selector map local is what
+   * lets a heal still work when the names in the list have been collapsed.
+   *
+   * The **names follow the snapshot's rule exactly** — kept for actionable roles,
+   * collapsed otherwise, via the same {@link ACTIONABLE_ROLES} test
+   * {@link collapseSnapshotLine} applies. That equality is the point rather than a
+   * convenience: candidates are derived from the snapshot, so any name this list kept
+   * while the snapshot collapsed it would be a disclosure channel opened by a feature
+   * that never mentioned privacy. A `cell "Smith, John"` is redacted in both or
+   * neither.
+   *
+   * @param candidates - Candidates as found on the live page.
+   * @param pageUrl - Page URL, passed to a custom redactor as context.
+   * @returns The list as it may be transmitted.
+   * @throws {PrivacyBlockedError} If a custom redactor vetoed or threw.
+   */
+  private scrubCandidates(
+    candidates: ElementCandidate[],
+    pageUrl: string
+  ): ElementCandidate[] {
+    const strict = this.policy.redact === 'strict';
+
+    /**
+     * Applies the snapshot's keep-or-collapse rule to one role/name pair.
+     *
+     * Pattern redaction only. A custom redactor is deliberately *not* called here —
+     * see the single pass below.
+     *
+     * @param role - The element's role.
+     * @param name - Its accessible name.
+     * @param byText - True when the candidate is addressed by its text rather than its
+     * role. Page content whatever the role, so the actionable-role exemption — which
+     * exists for accessible names, interface chrome like "Submit" — must not apply.
+     * @returns The name, pattern-redacted and collapsed where the policy says so.
+     */
+    const scrubName = (role: string, name: string, byText = false): string => {
+      if (strict && (byText || !ACTIONABLE_ROLES.has(role.toLowerCase()))) return REDACTED;
+      // Newlines would break the one-line-per-name framing the custom pass relies on.
+      // Accessible names are whitespace-normalised, so this is belt and braces.
+      return this.applyPatterns(name).replace(/[\r\n]+/g, ' ');
+    };
+
+    const scrubbed = candidates.map((candidate) => {
+      // `CandidateFinder` no longer builds a text handle for a value-bearing role, which
+      // is how a typed-in patient name once reached this method. This check is the
+      // second line: a future handle kind cannot reopen the hole silently.
+      const byText = candidate.selector?.includes('getByText(') ?? false;
+
+      return {
+        id: candidate.id,
+        role: candidate.role,
+        name: scrubName(candidate.role, candidate.name, byText),
+        context: candidate.context.map((entry: string) => {
+          const match = /^(\S+)\s+"([\s\S]*)"$/.exec(entry);
+          if (!match?.[1]) return this.applyPatterns(entry).replace(/[\r\n]+/g, ' ');
+          return `${match[1]} "${scrubName(match[1], match[2] ?? '')}"`;
+        }),
+        // A test id had never been transmitted before nameless candidates existed, so
+        // it gets the treatment a name gets, and one step more: under `strict` it is
+        // withheld outright rather than collapsed, since the element is still pickable
+        // by id and the locator it maps to stays here.
+        ...(candidate.testId !== undefined && !strict
+          ? { testId: this.applyPatterns(candidate.testId).replace(/[\r\n]+/g, ' ') }
+          : {}),
+        // selector: deliberately absent. See the note above.
+      };
+    });
+
+    return this.applyCustomToCandidates(scrubbed, pageUrl);
+  }
+
+  /**
+   * Shows a custom redactor every candidate name, in **one** call.
+   *
+   * Calling it per name was correct and unaffordable: a 120-candidate page invoked the
+   * redactor 364 times for a single heal, against about five before candidates existed.
+   * A redactor is caller-supplied code — it may log, rate-limit, or ask a classifier —
+   * so a seventyfold amplification is a behavioural change to a published extension
+   * point, not just wasted cycles. The names are therefore framed as one newline-
+   * delimited block, handed over once, and split back.
+   *
+   * Fails **closed** on a redactor that changes the line count. The alternative is
+   * guessing which name became which, and a privacy control may not guess: a
+   * mis-mapped name is a disclosure with a plausible-looking label on it. A redactor
+   * that wants to drop content should collapse the text on a line, not remove the line.
+   *
+   * @param candidates - Candidates already pattern-redacted and collapsed by policy.
+   * @param pageUrl - Page URL, passed to the redactor as context.
+   * @returns The candidates, with the redactor's edits applied.
+   * @throws {PrivacyBlockedError} If the redactor vetoed, threw, or reframed the block.
+   */
+  private applyCustomToCandidates(
+    candidates: ElementCandidate[],
+    pageUrl: string
+  ): ElementCandidate[] {
+    if (!this.policy.redactor || candidates.length === 0) return candidates;
+
+    // Every name in document order: the candidate's own, its test id if it has one, then
+    // each ancestry entry's. The test id travels, so the redactor must see it.
+    const names: string[] = [];
+    for (const candidate of candidates) {
+      names.push(candidate.name);
+      if (candidate.testId !== undefined) names.push(candidate.testId);
+      for (const entry of candidate.context) {
+        names.push(/^(\S+)\s+"([\s\S]*)"$/.exec(entry)?.[2] ?? entry);
+      }
+    }
+
+    const returned = this.applyCustom(names.join('\n'), 'snapshot', pageUrl).split('\n');
+
+    if (returned.length !== names.length) {
+      throw new PrivacyBlockedError(
+        `the configured redactor returned ${returned.length} line(s) for ${names.length} ` +
+          'candidate name(s), so they could no longer be matched up — nothing was ' +
+          'transmitted. Collapse the text on a line rather than adding or removing lines'
+      );
+    }
+
+    let next = 0;
+    return candidates.map((candidate) => ({
+      ...candidate,
+      name: returned[next++] ?? candidate.name,
+      ...(candidate.testId !== undefined ? { testId: returned[next++] ?? '' } : {}),
+      context: candidate.context.map((entry) => {
+        const match = /^(\S+)\s+"([\s\S]*)"$/.exec(entry);
+        const value = returned[next++] ?? '';
+        return match?.[1] ? `${match[1]} "${value}"` : value;
+      }),
+    }));
   }
 
   /**
@@ -493,7 +642,10 @@ export class PrivacyGuard {
     let reduced: string;
     try {
       const url = new URL(pageUrl);
-      const trimmed = `${url.origin}${this.applyPatterns(url.pathname)}`;
+      // An opaque origin serialises as the string "null": `about:blank` became
+      // "nullblank" in every prompt. The scheme is what identifies such a page.
+      const origin = url.origin === 'null' ? url.protocol : url.origin;
+      const trimmed = `${origin}${this.applyPatterns(url.pathname)}`;
       reduced = url.search || url.hash ? `${trimmed} (query omitted)` : trimmed;
     } catch {
       // Not a URL we can decompose — scrub it as plain text rather than pass it on.

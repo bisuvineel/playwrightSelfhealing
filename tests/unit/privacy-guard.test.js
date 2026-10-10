@@ -162,6 +162,12 @@ describe('PrivacyGuard — redact: identifiers', () => {
     assert.ok(pageUrl.startsWith('https://app.example.com/patients/'));
   });
 
+  it('keeps an opaque-origin URL readable — about:blank was sent as "nullblank"', () => {
+    // `new URL('about:blank').origin` is the string "null".
+    const { pageUrl } = guard.sanitizeRequest(request({ pageUrl: 'about:blank' }));
+    assert.equal(pageUrl, 'about:blank');
+  });
+
   it('scrubs the Playwright error message', () => {
     const { error } = guard.sanitizeRequest(request());
     assert.ok(!error.includes('patient.zero@hospital.example.com'));
@@ -593,5 +599,275 @@ describe('redactMessage / redactName — the text beside the selector', () => {
       const selector = "getByText('Smith, John')";
       assert.equal(guard.redactSelector(selector), guard.redactMessage(selector), level);
     }
+  });
+});
+
+describe('PrivacyGuard — the candidate list is not a way around the snapshot rule', () => {
+  /**
+   * Candidates as `CandidateFinder` builds them: derived from the snapshot, and
+   * carrying a locator that must never leave the machine.
+   *
+   * @returns {object[]} The list.
+   */
+  function candidates() {
+    return [
+      { id: 1, role: 'button', name: 'Place order', context: ['form "Checkout"'], selector: "getByRole('button', { name: 'Place order', exact: true })" },
+      { id: 2, role: 'cell', name: 'Smith, John', context: ['row "Smith, John"'], selector: "getByRole('cell', { name: 'Smith, John', exact: true })" },
+      { id: 3, role: 'textbox', name: 'Email address', context: [], selector: "getByRole('textbox', { name: 'Email address', exact: true })" },
+      { id: 4, role: 'link', name: 'patient.zero@hospital.example.com', context: [], selector: "getByRole('link', { name: 'x', exact: true })" },
+    ];
+  }
+
+  it('never transmits the locator, at any level', () => {
+    // The model answers with an id, so the expression is of no use to it — and keeping
+    // the map local is what lets a heal still work when the names are collapsed.
+    for (const redact of ['off', 'identifiers', 'strict']) {
+      const outbound = new PrivacyGuard({ redact }).sanitizeRequest(request({ candidates: candidates() }));
+      assert.ok(!transmitted(outbound).includes('getByRole('), redact);
+      for (const candidate of outbound.candidates) {
+        assert.equal(candidate.selector, undefined, redact);
+      }
+    }
+  });
+
+  it('keeps the ids, so a pick can still be resolved', () => {
+    const outbound = new PrivacyGuard({ redact: 'strict' }).sanitizeRequest(
+      request({ candidates: candidates() })
+    );
+    assert.deepEqual(outbound.candidates.map((c) => c.id), [1, 2, 3, 4]);
+    assert.deepEqual(outbound.candidates.map((c) => c.role), ['button', 'cell', 'textbox', 'link']);
+  });
+
+  it('collapses a name under strict exactly as the snapshot would', () => {
+    // The rule has to be the same in both places. A name this list kept while the
+    // snapshot collapsed it would be a disclosure channel opened by a feature that
+    // never mentioned privacy.
+    const outbound = new PrivacyGuard({ redact: 'strict' }).sanitizeRequest(
+      request({ candidates: candidates() })
+    );
+
+    const byId = new Map(outbound.candidates.map((c) => [c.id, c]));
+    assert.equal(byId.get(1).name, 'Place order', 'an actionable name is interface chrome');
+    assert.equal(byId.get(3).name, 'Email address', 'so is a field label');
+    assert.ok(!byId.get(2).name.includes('Smith'), 'a cell is data, and must collapse');
+    assert.ok(!transmitted(outbound).includes('Smith, John'));
+  });
+
+  it('collapses the ancestry too, by the same rule', () => {
+    const outbound = new PrivacyGuard({ redact: 'strict' }).sanitizeRequest(
+      request({ candidates: candidates() })
+    );
+    const row = outbound.candidates.find((c) => c.id === 2);
+    assert.ok(!row.context.join(' ').includes('Smith'), `context leaked: ${row.context}`);
+  });
+
+  it('applies patterns to an actionable name at identifiers level', () => {
+    // An email in a link's name is still an email.
+    const outbound = new PrivacyGuard({ redact: 'identifiers' }).sanitizeRequest(
+      request({ candidates: candidates() })
+    );
+    assert.ok(!transmitted(outbound).includes('patient.zero@hospital.example.com'));
+  });
+
+  it('scrubs the missing-text literals, which come from the test source', () => {
+    const outbound = new PrivacyGuard({ redact: 'identifiers' }).sanitizeRequest(
+      request({ missingText: ['patient.zero@hospital.example.com', 'Charter Cloud'] })
+    );
+    assert.ok(!transmitted(outbound).includes('patient.zero@hospital.example.com'));
+    assert.ok(transmitted(outbound).includes('Charter Cloud'), 'ordinary label text survives');
+  });
+
+  it('omits both fields entirely when the engine did not supply them', () => {
+    const outbound = new PrivacyGuard({ redact: 'strict' }).sanitizeRequest(request());
+    assert.equal('candidates' in outbound, false);
+    assert.equal('missingText' in outbound, false);
+  });
+});
+
+describe('PrivacyGuard — a text handle is page content, whatever its role', () => {
+  it('collapses a text-addressed candidate under strict even on an actionable role', () => {
+    // The hole this closes: the actionable-role exemption exists for accessible names,
+    // which on something you can act on are interface chrome ("Submit", "Email
+    // address"). A candidate addressed by TEXT is holding the text itself. Routing a
+    // typed-in value through that exemption sent a patient name at the strongest
+    // redaction level while the snapshot beside it read ‹redacted›.
+    const outbound = new PrivacyGuard({ redact: 'strict' }).sanitizeRequest(
+      request({
+        candidates: [
+          {
+            id: 1,
+            role: 'textbox',
+            name: 'Smith, John',
+            context: [],
+            selector: "getByText('Smith, John', { exact: true })",
+          },
+          {
+            id: 2,
+            role: 'textbox',
+            name: 'Patient name',
+            context: [],
+            selector: "getByRole('textbox', { name: 'Patient name', exact: true })",
+          },
+        ],
+      })
+    );
+
+    assert.ok(!transmitted(outbound).includes('Smith, John'), 'a text handle must collapse');
+    assert.equal(outbound.candidates[1].name, 'Patient name', 'a label still travels');
+  });
+
+  it('still applies patterns to a text handle below strict', () => {
+    const outbound = new PrivacyGuard({ redact: 'identifiers' }).sanitizeRequest(
+      request({
+        candidates: [
+          {
+            id: 1,
+            role: 'listitem',
+            name: 'patient.zero@hospital.example.com',
+            context: [],
+            selector: "getByText('patient.zero@hospital.example.com', { exact: true })",
+          },
+        ],
+      })
+    );
+
+    assert.ok(!transmitted(outbound).includes('patient.zero@hospital.example.com'));
+  });
+});
+
+describe('PrivacyGuard — a custom redactor sees the candidates once', () => {
+  /**
+   * A crowded candidate list, as a real application page produces.
+   *
+   * @returns {object[]} 120 candidates, each with two ancestry entries.
+   */
+  const crowded = () =>
+    Array.from({ length: 120 }, (_, i) => ({
+      id: i + 1,
+      role: 'button',
+      name: `Item ${i}`,
+      context: [`region "Outer ${i}"`, `group "Inner ${i}"`],
+      selector: `getByRole('button', { name: 'Item ${i}', exact: true })`,
+    }));
+
+  it('invokes it a handful of times, not once per name', () => {
+    // Per-name was correct and unaffordable: 364 invocations for one heal, against about
+    // five before candidates existed. A redactor is caller-supplied code that may log,
+    // rate-limit, or ask a classifier, so that is a behavioural change to a published
+    // extension point.
+    let calls = 0;
+    const guard = new PrivacyGuard({
+      redact: 'identifiers',
+      redactor: (text) => {
+        calls += 1;
+        return text;
+      },
+    });
+
+    guard.sanitizeRequest(request({ candidates: crowded() }));
+    assert.ok(calls < 10, `expected a handful of invocations, got ${calls}`);
+  });
+
+  it('still applies its edits, to the right names', () => {
+    const guard = new PrivacyGuard({
+      redact: 'identifiers',
+      redactor: (text) => text.replace(/Item/g, 'X').replace(/Outer/g, 'O'),
+    });
+
+    const outbound = guard.sanitizeRequest(request({ candidates: crowded() }));
+
+    assert.equal(outbound.candidates[3].name, 'X 3', 'the edit must land on the right line');
+    assert.deepEqual(outbound.candidates[3].context, ['region "O 3"', 'group "Inner 3"']);
+    assert.equal(outbound.candidates[119].name, 'X 119', 'alignment must hold to the end');
+  });
+
+  it('fails closed when a redactor reframes the block rather than guessing', () => {
+    // A mis-mapped name is a disclosure wearing a plausible label, so this may not guess.
+    for (const [label, redactor] of [
+      ['adds a line', (text) => `${text}\nextra`],
+      ['drops a line', (text) => text.split('\n').slice(1).join('\n')],
+    ]) {
+      assert.throws(
+        () =>
+          new PrivacyGuard({ redact: 'identifiers', redactor }).sanitizeRequest(
+            request({ candidates: crowded() })
+          ),
+        /could no longer be matched up/,
+        label
+      );
+    }
+  });
+
+  it('still honours a veto', () => {
+    assert.throws(
+      () =>
+        new PrivacyGuard({ redact: 'identifiers', redactor: () => null }).sanitizeRequest(
+          request({ candidates: crowded() })
+        ),
+      /vetoed/
+    );
+  });
+});
+
+describe('PrivacyGuard — test ids of nameless candidates', () => {
+  const withIcon = (extra = {}) => ({
+    originalSelector: '#close-x',
+    originalAction: 'click',
+    ariaSnapshot: '- button',
+    pageUrl: 'https://app.test/patients',
+    testFile: 'tests/p.spec.ts',
+    testLine: 1,
+    candidates: [
+      { id: 1, role: 'button', name: 'Save', context: [], selector: "getByRole('button', { name: 'Save', exact: true })" },
+      { id: 2, role: 'button', name: '', context: [], testId: 'patient-884213701-close', selector: '[data-testid="patient-884213701-close"]' },
+    ],
+    ...extra,
+  });
+  const icon = (request) => request.candidates.find((c) => c.id === 2);
+
+  it('applies the identifier patterns to a test id by default', () => {
+    const sent = icon(new PrivacyGuard({ redact: 'identifiers' }).sanitizeRequest(withIcon()));
+    assert.ok(!sent.testId.includes('884213701'), sent.testId);
+    assert.match(sent.testId, /^patient-.+-close$/);
+  });
+
+  it('withholds the test id entirely under strict', () => {
+    const sent = icon(new PrivacyGuard({ redact: 'strict' }).sanitizeRequest(withIcon()));
+    assert.equal('testId' in sent, false);
+  });
+
+  it('leaves it alone when redaction is off', () => {
+    const sent = icon(new PrivacyGuard({ redact: 'off' }).sanitizeRequest(withIcon()));
+    assert.equal(sent.testId, 'patient-884213701-close');
+  });
+
+  it('never transmits the locator, at any level', () => {
+    for (const redact of ['off', 'identifiers', 'strict']) {
+      const sent = new PrivacyGuard({ redact }).sanitizeRequest(withIcon());
+      for (const candidate of sent.candidates) assert.equal(candidate.selector, undefined, redact);
+    }
+  });
+
+  it('shows the test id to a custom redactor, and keeps every name matched up', () => {
+    const seen = [];
+    const guard = new PrivacyGuard({
+      redact: 'identifiers',
+      redactor: (text, context) => {
+        if (context.field === 'snapshot') seen.push(text);
+        return context.field === 'snapshot' ? text.replace(/patient/g, 'P') : text;
+      },
+    });
+    const sent = guard.sanitizeRequest(withIcon());
+    assert.ok(seen.some((text) => text.includes('patient-')), 'the redactor saw the test id');
+    assert.match(icon(sent).testId, /^P-/);
+    assert.equal(sent.candidates[0].name, 'Save', 'the name before it did not shift');
+  });
+
+  it('lets a custom redactor veto a heal over a test id', () => {
+    const guard = new PrivacyGuard({
+      redact: 'identifiers',
+      redactor: (text, context) => (context.field === 'snapshot' && text.includes('patient') ? null : text),
+    });
+    assert.throws(() => guard.sanitizeRequest(withIcon()), /redactor|blocked|veto/i);
   });
 });

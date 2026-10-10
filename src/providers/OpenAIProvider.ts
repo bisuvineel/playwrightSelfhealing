@@ -12,10 +12,21 @@
 
 import { AiProvider, type HealOptions } from '../core/AiProvider';
 import type { HealingRequest, HealingResponse } from '../types';
-import { HttpError, postJson } from './httpJson';
+import { asProviderFailure, HttpError, postJson } from './httpJson';
 
 /** Default API root. Overridden by `OPENAI_BASE_URL` or the `baseUrl` option. */
 const DEFAULT_BASE_URL = 'https://api.openai.com/v1';
+
+/**
+ * Appends `?api-version=<ver>` to a URL when a version is supplied.
+ *
+ * Azure OpenAI requires this query parameter on every Chat Completions call.
+ * Standard OpenAI does not use it, so the helper is a no-op when the version
+ * is absent.
+ */
+function withApiVersion(url: string, version: string | undefined): string {
+  return version ? `${url}?api-version=${encodeURIComponent(version)}` : url;
+}
 
 /**
  * Reasoning models spend completion tokens on internal reasoning before writing any
@@ -28,6 +39,17 @@ const REASONING_MODEL_PATTERN = /^(?:o\d|gpt-5)/i;
 /** Output ceiling used for reasoning models. */
 const REASONING_MAX_TOKENS = 4_096;
 
+/**
+ * Models that accept `temperature`, so a heal can be made repeatable.
+ *
+ * An allowlist, for the reason the Anthropic provider's is one: reasoning models reject
+ * any temperature but the default, so sending it to a model this package did not know
+ * about would fail every heal, while omitting it only leaves default sampling. The
+ * `gpt-4` and `gpt-3.5` families accept it; anything matching
+ * {@link REASONING_MODEL_PATTERN} is excluded outright.
+ */
+const SAMPLING_MODEL_PATTERN = /^gpt-(?:4|3\.5)/i;
+
 /** Optional tuning. */
 export interface OpenAIProviderOptions {
   /** Per-request timeout in ms. Pair with `HEALER_TIMEOUT`. */
@@ -36,6 +58,12 @@ export interface OpenAIProviderOptions {
   maxRetries?: number;
   /** API root override. Defaults to `OPENAI_BASE_URL`, then the public endpoint. */
   baseUrl?: string;
+  /**
+   * Azure OpenAI API version, e.g. `"2025-01-01-preview"`. Appended as
+   * `?api-version=<ver>` on every request. Defaults to `OPENAI_API_VERSION`.
+   * Not needed for standard OpenAI.
+   */
+  apiVersion?: string;
   /** Organisation header, if your account requires one. */
   organization?: string;
   /**
@@ -53,9 +81,14 @@ interface ChatCompletionResponse {
     message?: { content?: string | null };
     finish_reason?: string;
   }>;
+  /** The model that served the request — the dated snapshot behind an alias. */
+  model?: string;
   usage?: {
+    /** All input tokens, cached or not. */
     prompt_tokens?: number;
     completion_tokens?: number;
+    /** Automatic prompt caching: how many of `prompt_tokens` were served from cache. */
+    prompt_tokens_details?: { cached_tokens?: number };
   };
 }
 
@@ -64,6 +97,7 @@ interface ChatCompletionResponse {
  */
 export class OpenAIProvider extends AiProvider {
   private baseUrl: string;
+  private apiVersion: string | undefined;
   private timeoutMs: number;
   private maxRetries: number;
   private organization?: string;
@@ -82,6 +116,7 @@ export class OpenAIProvider extends AiProvider {
       /\/+$/,
       ''
     );
+    this.apiVersion = options.apiVersion ?? process.env.OPENAI_API_VERSION;
     this.timeoutMs = options.timeoutMs ?? 30_000;
     this.maxRetries = options.maxRetries ?? 2;
     this.jsonMode = options.jsonMode ?? true;
@@ -111,7 +146,7 @@ export class OpenAIProvider extends AiProvider {
     let response: ChatCompletionResponse;
     try {
       response = await postJson<ChatCompletionResponse>({
-        url: `${this.baseUrl}/chat/completions`,
+        url: withApiVersion(`${this.baseUrl}/chat/completions`, this.apiVersion),
         headers: this.buildHeaders(),
         body: this.buildBody(request),
         timeoutMs: this.timeoutMs,
@@ -122,7 +157,8 @@ export class OpenAIProvider extends AiProvider {
         ...(options.signal ? { signal: options.signal } : {}),
       });
     } catch (error) {
-      throw this.describeError(error, 'Healing request failed');
+      // Classified on the original error, before it is rewritten for display.
+      throw asProviderFailure(error, this.describeError(error, 'Healing request failed'));
     }
 
     const choice = response.choices?.[0];
@@ -141,16 +177,31 @@ export class OpenAIProvider extends AiProvider {
     }
 
     const parsed = this.parseResponse(text);
-    if (!parsed.suggestedSelector) {
+    // Throw only when there is no answer at all. `parseResponse` leaves `confidence`
+    // unset exactly when it found no usable JSON object, which is a malformed reply.
+    //
+    // A parsed answer that names nothing is not malformed — it is a **refusal**, and the
+    // prompt asks for one: "if no element on the page plausibly matches, return confidence
+    // 0". Throwing on it treated the model's most careful answer as an outage. Measured
+    // against the real claude-haiku-4-5 refusal: three honest refusals opened the circuit
+    // breaker, healing stopped for the rest of the run on a healthy provider, ~9,000 tokens
+    // were billed and none recorded, and the model's reasoning — the one thing a human
+    // needed — was discarded. After a redesign several elements genuinely are gone, so it
+    // fired exactly when healing mattered most. The engine now reports a refusal as one.
+    if (parsed.confidence === undefined) {
       throw new Error(
-        `OpenAI returned no usable selector (finish_reason: ${choice?.finish_reason ?? 'unknown'}).`
+        `OpenAI returned no usable answer (finish_reason: ${choice?.finish_reason ?? 'unknown'}).`
       );
     }
 
     const result: HealingResponse = {
-      suggestedSelector: parsed.suggestedSelector,
+      // Empty when the model answered with an id alone; `HealingEngine.resolveChoices`
+      // fills it in from the candidate that id names.
+      suggestedSelector: parsed.suggestedSelector ?? '',
       confidence: parsed.confidence ?? 0,
       reasoning: parsed.reasoning ?? '',
+      ...(parsed.candidateId !== undefined ? { candidateId: parsed.candidateId } : {}),
+      ...(parsed.alternatives !== undefined ? { alternatives: parsed.alternatives } : {}),
       // Spread-in rather than assigned: `exactOptionalPropertyTypes` rejects an
       // explicit `undefined` on an optional field, and the intent check treats a
       // missing claim differently from an empty one.
@@ -159,8 +210,14 @@ export class OpenAIProvider extends AiProvider {
       tokenUsage: {
         input: response.usage?.prompt_tokens ?? 0,
         output: response.usage?.completion_tokens ?? 0,
+        // OpenAI caches long prompt prefixes automatically; this is how to see it happen.
+        ...(response.usage?.prompt_tokens_details?.cached_tokens
+          ? { cached: response.usage.prompt_tokens_details.cached_tokens }
+          : {}),
       },
-      provider: `openai:${this.model}`,
+      // An Azure model name is a deployment label, and the deployment pins the version,
+      // so there is nothing to recommend pinning there.
+      provider: `openai:${this.servedModel(response.model, !this.apiVersion)}`,
     };
 
     // The suggestion is logged at debug only — see the note in AnthropicProvider.heal.
@@ -168,9 +225,68 @@ export class OpenAIProvider extends AiProvider {
       `Answered for "${request.originalSelector}" with confidence ${result.confidence} — ` +
         `${result.tokenUsage.input} in / ${result.tokenUsage.output} out tokens.`
     );
-    this.logDebug(`Suggested selector: ${result.suggestedSelector}`);
+    this.logDebug(
+      `Suggested: ${result.candidateId !== undefined ? `candidate ${result.candidateId}` : result.suggestedSelector}` +
+        `${result.alternatives?.length ? ` (+${result.alternatives.length} alternative(s))` : ''}`
+    );
 
     return result;
+  }
+
+  /**
+   * One plain exchange, for the second-opinion check. Same transport, deadline, model
+   * and sampling rules as {@link heal}.
+   *
+   * @param system - System prompt.
+   * @param user - User prompt.
+   * @param options - Per-call controls.
+   * @returns The reply text, cost and served model.
+   */
+  protected async complete(
+    system: string,
+    user: string,
+    options: HealOptions = {}
+  ): Promise<{ text: string; tokenUsage: HealingResponse['tokenUsage']; provider: string }> {
+    const tokenField = this.apiVersion ? 'max_tokens' : 'max_completion_tokens';
+    const model = options.model ?? this.model;
+
+    let response: ChatCompletionResponse;
+    try {
+      response = await postJson<ChatCompletionResponse>({
+        url: withApiVersion(`${this.baseUrl}/chat/completions`, this.apiVersion),
+        headers: this.buildHeaders(),
+        body: {
+          model,
+          messages: [
+            { role: 'system', content: system },
+            { role: 'user', content: user },
+          ],
+          // The heal ceiling, not a small one: a reasoning model spends output tokens
+          // before it writes anything, and a cut-off reply would read as "no".
+          [tokenField]: this.maxTokens,
+          ...(this.jsonMode ? { response_format: { type: 'json_object' } } : {}),
+          ...(SAMPLING_MODEL_PATTERN.test(model) && !REASONING_MODEL_PATTERN.test(model)
+            ? { temperature: 0 }
+            : {}),
+        },
+        timeoutMs: this.timeoutMs,
+        maxRetries: this.maxRetries,
+        ...(this.fetchImpl ? { fetchImpl: this.fetchImpl } : {}),
+        label: 'OpenAI confirmation request',
+        ...(options.signal ? { signal: options.signal } : {}),
+      });
+    } catch (error) {
+      throw asProviderFailure(error, this.describeError(error, 'Confirmation request failed'));
+    }
+
+    return {
+      text: response.choices?.[0]?.message?.content ?? '',
+      tokenUsage: {
+        input: response.usage?.prompt_tokens ?? 0,
+        output: response.usage?.completion_tokens ?? 0,
+      },
+      provider: `openai:${this.servedModel(response.model, !this.apiVersion)}`,
+    };
   }
 
   /**
@@ -189,12 +305,12 @@ export class OpenAIProvider extends AiProvider {
 
     try {
       await postJson<ChatCompletionResponse>({
-        url: `${this.baseUrl}/chat/completions`,
+        url: withApiVersion(`${this.baseUrl}/chat/completions`, this.apiVersion),
         headers: this.buildHeaders(),
         body: {
           model: this.model,
           messages: [{ role: 'user', content: 'Hi' }],
-          max_completion_tokens: 16,
+          ...(this.apiVersion ? { max_tokens: 16 } : { max_completion_tokens: 16 }),
         },
         timeoutMs: this.timeoutMs,
         maxRetries: 0,
@@ -217,7 +333,10 @@ export class OpenAIProvider extends AiProvider {
 
   /** Auth and routing headers for every request. */
   private buildHeaders(): Record<string, string> {
-    const headers: Record<string, string> = { authorization: `Bearer ${this.apiKey}` };
+    // Azure OpenAI uses `api-key` header; standard OpenAI uses `Authorization: Bearer`.
+    const headers: Record<string, string> = this.apiVersion
+      ? { 'api-key': this.apiKey }
+      : { authorization: `Bearer ${this.apiKey}` };
     if (this.organization) headers['openai-organization'] = this.organization;
     return headers;
   }
@@ -234,14 +353,20 @@ export class OpenAIProvider extends AiProvider {
    * @returns The request body.
    */
   private buildBody(request: HealingRequest): Record<string, unknown> {
+    // Azure OpenAI uses `max_tokens`; standard OpenAI >=2024-10 uses `max_completion_tokens`.
+    const tokenField = this.apiVersion ? 'max_tokens' : 'max_completion_tokens';
     return {
       model: this.model,
       messages: [
-        { role: 'system', content: this.buildSystemPrompt() },
+        { role: 'system', content: this.buildSystemPrompt(request) },
         { role: 'user', content: this.buildUserPrompt(request) },
       ],
-      max_completion_tokens: this.maxTokens,
+      [tokenField]: this.maxTokens,
       ...(this.jsonMode ? { response_format: { type: 'json_object' } } : {}),
+      // Repeatable heals where the model allows it. See SAMPLING_MODEL_PATTERN.
+      ...(SAMPLING_MODEL_PATTERN.test(this.model) && !REASONING_MODEL_PATTERN.test(this.model)
+        ? { temperature: 0 }
+        : {}),
     };
   }
 

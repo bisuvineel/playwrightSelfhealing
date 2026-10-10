@@ -53,7 +53,7 @@ test.describe('checkout journey', () => {
     await expect(paymentFramePage.cardNumberField).toHaveValue('4111111111111111');
   });
 
-  test('the form refuses to submit without the terms accepted', async ({
+  test.only('the form refuses to submit without the terms accepted', async ({
     cartPage,
     checkoutPage,
     page,

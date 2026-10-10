@@ -183,7 +183,7 @@ export type { PostJsonOptions } from './providers/httpJson';
 
 /** Orchestrates one healing attempt: snapshot, ask, validate, record. */
 export { HealingEngine } from './core/HealingEngine';
-export type { HealingEngineOptions, HealOutcome } from './core/HealingEngine';
+export type { HealAttemptOptions, HealingEngineOptions, HealOutcome } from './core/HealingEngine';
 
 /**
  * Annotation types published to the Playwright report (`healed`, `heal-failed`,

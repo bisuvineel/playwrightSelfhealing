@@ -1,4 +1,4 @@
-# Design — healing chained locators (0.5.0)
+# Design — healing chained locators (a later minor release)
 
 > **Internal document, deliberately not shipped** — `files` in `package.json` is an explicit
 > allowlist, so this stays out of the tarball like `AUDIT.md` and `AUDIT2.md`. Nothing under
@@ -215,7 +215,7 @@ Each stage is independently shippable and leaves the package correct.
 Stopping after 2 is a coherent release. Stopping after 3 is coherent. That is deliberate:
 if the walker proves harder than estimated, there is a good place to stop.
 
-**Estimate: 2–3 days for all five stages.** Ships as **0.5.0** — new capability, not a fix.
+**Estimate: 2–3 days for all five stages.** Ships as the next **minor** release after 0.5.0 — new capability, not a fix.
 
 ---
 

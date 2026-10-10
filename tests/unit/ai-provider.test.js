@@ -237,3 +237,106 @@ describe('sanitizeSelector — stripping what models decorate answers with', () 
     assert.equal(clean('   '), '');
   });
 });
+
+describe('parseResponse — a pick, and the runners-up', () => {
+  const probe = new Probe('key', 'model');
+
+  it('reads a candidateId', () => {
+    const result = quiet(() => probe.parse('{"candidateId": 12, "confidence": 0.9, "reasoning": "r"}'));
+    assert.equal(result.candidateId, 12);
+    assert.equal(result.confidence, 0.9);
+  });
+
+  it('accepts the decorations models put on a number', () => {
+    // The list is rendered with plain numbers; models quote and hash them anyway.
+    assert.equal(quiet(() => probe.parse('{"candidateId": "12", "confidence": 1}')).candidateId, 12);
+    assert.equal(quiet(() => probe.parse('{"candidateId": "#12", "confidence": 1}')).candidateId, 12);
+    assert.equal(quiet(() => probe.parse('{"candidateId": " 12 ", "confidence": 1}')).candidateId, 12);
+  });
+
+  it('refuses an id that cannot index a 1-based list', () => {
+    // Zero means the model counted from the wrong end, so its answer is not about the
+    // element it described. Dropped, so the engine rejects with a reason.
+    for (const bad of ['0', '-1', '1.5', '"twelve"', 'null', 'true', '{}']) {
+      const result = quiet(() => probe.parse(`{"candidateId": ${bad}, "confidence": 1}`));
+      assert.equal(result.candidateId, undefined, bad);
+    }
+  });
+
+  it('takes the id and the selector when a model sends both', () => {
+    const result = quiet(() =>
+      probe.parse('{"candidateId": 3, "suggestedSelector": "getByRole(\'link\')", "confidence": 1}')
+    );
+    assert.equal(result.candidateId, 3);
+    assert.equal(result.suggestedSelector, "getByRole('link')");
+  });
+
+  it('does not complain about a missing selector when an id answered', () => {
+    let complained = false;
+    const saved = console.error;
+    console.error = (line) => {
+      if (String(line).includes('missing')) complained = true;
+    };
+    try {
+      probe.parse('{"candidateId": 4, "confidence": 0.9, "reasoning": "r"}');
+    } finally {
+      console.error = saved;
+    }
+    assert.equal(complained, false);
+  });
+
+  it('still reports an answer that named neither', () => {
+    const result = quiet(() => probe.parse('{"confidence": 0.9, "reasoning": "r"}'));
+    assert.equal(result.candidateId, undefined);
+    assert.equal(result.suggestedSelector, undefined);
+  });
+
+  it('reads alternatives in the order they were ranked', () => {
+    const result = quiet(() =>
+      probe.parse(`{
+        "candidateId": 2, "confidence": 0.9, "reasoning": "first",
+        "alternatives": [
+          { "candidateId": 7, "confidence": 0.6, "reasoning": "second" },
+          { "suggestedSelector": "getByTestId('x')", "confidence": "0.4", "reasoning": "third" }
+        ]
+      }`)
+    );
+
+    assert.equal(result.alternatives.length, 2);
+    assert.equal(result.alternatives[0].candidateId, 7);
+    assert.equal(result.alternatives[1].suggestedSelector, "getByTestId('x')");
+    assert.equal(result.alternatives[1].confidence, 0.4);
+  });
+
+  it('drops an unusable alternative without losing the rest', () => {
+    // An alternative is a bonus, tried locally and free when wrong, so one malformed
+    // entry must not cost the others.
+    const result = quiet(() =>
+      probe.parse(`{
+        "candidateId": 1, "confidence": 0.9,
+        "alternatives": [
+          { "confidence": 0.5, "reasoning": "names nothing to try" },
+          "not an object",
+          null,
+          { "candidateId": 5, "confidence": 0.5, "reasoning": "fine" }
+        ]
+      }`)
+    );
+
+    assert.equal(result.alternatives.length, 1);
+    assert.equal(result.alternatives[0].candidateId, 5);
+  });
+
+  it('leaves alternatives unset when there are none, or the field is junk', () => {
+    assert.equal(quiet(() => probe.parse('{"candidateId": 1, "confidence": 1}')).alternatives, undefined);
+    assert.equal(quiet(() => probe.parse('{"candidateId": 1, "confidence": 1, "alternatives": []}')).alternatives, undefined);
+    assert.equal(quiet(() => probe.parse('{"candidateId": 1, "confidence": 1, "alternatives": "x"}')).alternatives, undefined);
+  });
+
+  it('clamps an alternative confidence like any other', () => {
+    const result = quiet(() =>
+      probe.parse('{"candidateId": 1, "confidence": 1, "alternatives": [{"candidateId": 2, "confidence": 9}]}')
+    );
+    assert.equal(result.alternatives[0].confidence, 1);
+  });
+});
